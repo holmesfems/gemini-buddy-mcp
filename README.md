@@ -1,5 +1,9 @@
 # gemini-buddy-mcp
 
+![テラコッタ色の司令塔ロボと、ヘッドホンをした青紫の相棒ロボが机で協力し、相棒が動画・音声・画像を差し出している絵](docs/hero.png)
+
+<sub>この絵も gemini-buddy-mcp で作りました（`gemini_consult` で Gemini と案を相談し、`gemini_generate_image` の `backend="agy"` で生成）。</sub>
+
 Claude Code などの MCP クライアントから Gemini を「相棒」として呼ぶための、stdio 型の MCP サーバーです。[agy-media](https://github.com/holmesfems/agy-media)（スキル版）の中身をすべて MCP のツールに移しました。
 
 - **相談・メディア解析・コードレビュー**は、サブスクでログイン済みの [Antigravity CLI](https://antigravity.google/)（`agy`）をサブプロセスで動かします。子プロセスの環境変数から `GEMINI_API_KEY`・`GOOGLE_API_KEY` を消すので、API キーの課金には流れません。
