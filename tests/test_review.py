@@ -42,6 +42,24 @@ class SecretLine(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertFalse(review.SECRET_LINE.search(line))
 
+    def test_variable_references_are_not_secrets(self):
+        name = "GEMINI_" + "API_KEY"
+        for line in [f'+claude mcp add x -e {name}="${name}" -- run',
+                     f'+  {KEY}: "${{{name}}}"',
+                     f'+  {KEY}: "${{{{ secrets.{name} }}}}"',
+                     f'+set {KEY}="%{name}%"',
+                     f'+$env:{name}="$env:{name}_FROM_USER"']:
+            with self.subTest(line=line):
+                self.assertFalse(review.SECRET_LINE.search(line))
+        # values that only start with $ or % are not references and still count
+        for line in [f'+{KEY} = "{VAL}$x"',
+                     f'+{PW} = "$2b$12$eImiTXuWVxfM37uY4JANjQ"',   # bcrypt hash
+                     f'+{PW} = "$uperSecretPass123!"',
+                     f'+{TOK} = "%2FrealSecretToken123"',          # URL-encoded
+                     f'+{KEY} = "${{{VAL}"']:                      # unclosed brace
+            with self.subTest(line=line):
+                self.assertTrue(review.SECRET_LINE.search(line))
+
     def test_removed_and_context_lines_count(self):
         key = "AIza" + "A" * 35
         diff = (f"diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,3 +1,3 @@\n"

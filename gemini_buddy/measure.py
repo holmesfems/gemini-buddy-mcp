@@ -68,12 +68,17 @@ def mix_balance(mix_path: str, voice_path: str, start: float = 0.0, end: float |
 
     v = np.zeros_like(mix)
     if voice_start is not None:
-        lag = best_lag(mix[: SR * 20], voice[: SR * 10])
+        # the piece of voice searched for must be shorter than the stretch of mix searched in,
+        # or there is no room to slide it (short ranges: use at most half of the mix)
+        piece = voice[: min(SR * 10, len(mix) // 2)]
+        lag = best_lag(mix[: SR * 20], piece)
         n = min(len(mix) - lag, len(voice))
         v[lag:lag + n] = voice[:n]
         offset = vs - (start + lag / SR)
     else:
-        k = best_lag(voice, mix[: SR * 10])
+        # likewise the piece of mix must be shorter than the voice read around it
+        piece = mix[: min(SR * 10, len(mix), len(voice) // 2)]
+        k = best_lag(voice, piece)
         n = min(len(mix), len(voice) - k)
         v[:n] = voice[k:k + n]
         offset = vs + k / SR - start
@@ -101,7 +106,7 @@ def mix_balance(mix_path: str, voice_path: str, start: float = 0.0, end: float |
     result = {
         "mix": str(mix_src), "voice": str(voice_src), "range": [start, end],
         "voice_track_offset_s": round(offset, 3),
-        "note": ("mix time t = voice-track time t + offset. Talk videos usually keep BGM 12-20 dB "
+        "note": ("at mix time t the voice track is at t + voice_track_offset_s. Talk videos usually keep BGM 12-20 dB "
                  f"under the voice; buried_spans are windows where voice - BGM < {min_db} dB."),
         "voice_gain": round(g, 3),
         "mean_voice_minus_bgm_db": round(float(np.mean(diffs)), 1) if diffs else None,

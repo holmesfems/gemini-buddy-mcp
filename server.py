@@ -27,6 +27,7 @@ import tempfile
 import time
 import uuid
 import wave
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -96,7 +97,7 @@ Gemini を相棒にするツール群。Claude にできない・苦手なこと
   書かせ、次に BGM のジャンル・テンポ・雰囲気・楽器、場面に合うか（1〜5 と理由）、不自然なつなぎ目、直し方の案。場面の説明も添える。
 - 座標（media_frames の grid=100 のコマを数枚、model=gemini-4-neon-high）: 対象を見た目と最初のコマでのだいたいの位置で指定し、
   "read the grid labels; answer JSON only: {"track": [{"frame": "f_001.png", "x": .., "y": ..}]}; null if not visible"。
-  答えはそのまま media_overlay の points に渡して確かめる。
+  答えの {"track": [...]} をそのまま media_overlay の points の 1 要素として渡して（points=[答え]）確かめる。
 """
 
 
@@ -206,6 +207,76 @@ def save_session(s: Session) -> None:
     os.replace(tmp, path)
 
 
+LOCK_WAIT = 10.0   # seconds to wait for another call to finish saving the same session
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _try_lock(f) -> bool:
+        f.seek(0)
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    def _unlock(f) -> None:
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _try_lock(f) -> bool:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    def _unlock(f) -> None:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def session_lock(session_id: str):
+    """An OS file lock on `<session>.lock`, so concurrent calls (other threads or other server
+    processes) save one after another instead of overwriting each other. The OS releases it if a
+    process dies, so a crash never leaves the session locked; the file itself just stays."""
+    lock = session_path(session_id).with_suffix(".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + LOCK_WAIT
+    with open(lock, "a+b") as f:
+        while not _try_lock(f):
+            if time.time() > deadline:
+                raise Fail(f"session {session_id} is busy (another call is saving it); try again")
+            time.sleep(0.05)
+        try:
+            yield
+        finally:
+            _unlock(f)
+
+
+def update_session(s: Session, change) -> Session:
+    """Apply `change` to the latest saved copy of `s` and save it, under the session lock.
+
+    Tools load a session before a long model call; re-reading here keeps what other calls
+    saved in the meantime. A session that was never saved starts from `s` itself.
+    """
+    with session_lock(s.session_id):
+        path = session_path(s.session_id)
+        latest = (Session.model_validate_json(path.read_text(encoding="utf-8")) if path.exists()
+                  else s.model_copy(deep=True))
+        change(latest)
+        save_session(latest)
+    return latest
+
+
+def require_session(session_id: str | None) -> None:
+    """Fail before any slow work when a given session_id does not exist."""
+    if session_id:
+        open_session(session_id, "")
+
+
 def session_context(s: Session) -> str:
     """Recent turns plus the standing notes (media summaries, generated files)."""
     made = [a for a in s.artifacts if a.kind in ("image", "audio")]
@@ -237,8 +308,11 @@ def work_dir(name: str, out_dir: str | None, session_id: str | None) -> Path:
         p = Path(out_dir).expanduser().resolve()
     else:
         owner = valid_session_id(session_id) if session_id else "_misc"
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-        p = home() / "work" / owner / f"{name}-{stamp}"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        # a random suffix: two calls in the same instant must not share (and clean) one folder
+        p = home() / "work" / owner / f"{name}-{stamp}-{uuid.uuid4().hex[:8]}"
+        p.mkdir(parents=True)
+        return p
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -247,9 +321,8 @@ def record(session_id: str | None, kind: str, path: str, note: str) -> None:
     """Remember a local tool's output in the session, when one was given."""
     if not session_id:
         return
-    s = open_session(session_id, note)
-    s.artifacts.append(Artifact(kind=kind, path=path, prompt=note, at=now()))
-    save_session(s)
+    update_session(open_session(session_id, note),
+                   lambda x: x.artifacts.append(Artifact(kind=kind, path=path, prompt=note, at=now())))
 
 
 # ---------------------------------------------------------------- agy backend
@@ -263,12 +336,22 @@ def agy_command(prompt: str, model: str, dirs: list[Path], mode: str = "plan") -
     return cmd
 
 
+def agy_workspace() -> Path:
+    """An empty folder to run agy in. agy treats its working folder as the workspace, so running it
+    in the server's folder (often the user's project) would let it read, and in accept-edits mode
+    edit, files there. Only the folders passed with --add-dir should be reachable."""
+    p = home() / "agy-cwd"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def run_agy(prompt: str, model: str, dirs: list[Path], mode: str = "plan",
             guard: str = GUARD, need_text: bool = True) -> dict:
     t0 = time.time()
     try:
         r = subprocess.run(agy_command(guard + prompt, model, dirs, mode), capture_output=True,
-                           env=agy_env(), stdin=subprocess.DEVNULL, timeout=AGY_TIMEOUT + 60)
+                           env=agy_env(), stdin=subprocess.DEVNULL, timeout=AGY_TIMEOUT + 60,
+                           cwd=str(agy_workspace()))
     except FileNotFoundError:
         raise Fail(f"agy not found ({AGY}); install Antigravity CLI or set GEMINI_BUDDY_AGY")
     except subprocess.TimeoutExpired:
@@ -322,9 +405,12 @@ def agy_images(conv_id: str, since: float) -> list[Path]:
 def genai_client(api_version: str | None = None):
     """api_version: the SDK may default to the stable v1 API, which lacks some fields
     (TTS's speech_config is only in v1beta)."""
-    key = os.environ.get("GEMINI_API_KEY")
+    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
     if not key:
-        raise Fail("GEMINI_API_KEY is not set; API generation uses the API credit "
+        why = ("is set but empty (registered with `-e GEMINI_API_KEY=...` from a shell that had no key? "
+               "Register without -e so the server inherits it, then restart the client)"
+               if "GEMINI_API_KEY" in os.environ else "is not set")
+        raise Fail(f"GEMINI_API_KEY {why}; API generation uses the API credit "
                    "(for images, backend='agy' uses the subscription instead)")
     from google import genai
     if api_version:
@@ -356,6 +442,16 @@ def output_file(path: str) -> Path:
     return p
 
 
+def free_path(p: Path) -> Path:
+    """`p`, or `name-1.ext`, `name-2.ext`... when something is already there."""
+    if not p.exists():
+        return p
+    n = 1
+    while (q := p.with_name(f"{p.stem}-{n}{p.suffix}")).exists():
+        n += 1
+    return q
+
+
 MIME_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
 EXT_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
 
@@ -376,7 +472,7 @@ def write_image(data: bytes, mime: str, out: Path) -> Path:
         img.save(out)
         return out
     except ImportError:
-        alt = out.with_suffix(got)
+        alt = free_path(out.with_suffix(got))  # never overwrite a different file the user has
         alt.write_bytes(data)
         return alt
 
@@ -389,26 +485,41 @@ def pcm_rate(mime: str) -> int:
     return 24000
 
 
-def write_audio(pcm: bytes, rate: int, out: Path) -> Path:
-    """TTS returns 16-bit mono PCM. Write WAV; other extensions go through ffmpeg if present."""
-    wav = out if out.suffix.lower() == ".wav" else out.with_suffix(".wav")
-    with wave.open(str(wav), "wb") as w:
+def write_wav(pcm: bytes, rate: int, path: Path) -> None:
+    with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(rate)
         w.writeframes(pcm)
-    if wav == out:
+
+
+def write_audio(pcm: bytes, rate: int, out: Path) -> Path:
+    """TTS returns 16-bit mono PCM. Write WAV; other extensions go through ffmpeg if present.
+
+    The intermediate WAV is a temporary file, so an existing `<name>.wav` next to `out` is never
+    touched. Without ffmpeg (or if it fails) the WAV is kept under a free `<name>.wav` name.
+    """
+    if out.suffix.lower() == ".wav":
+        write_wav(pcm, rate, out)
         return out
+    fd, tmp_name = tempfile.mkstemp(dir=out.parent, prefix=f".{out.stem}-", suffix=".wav")
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
-        ffmpeg = media.find_ffmpeg()
-    except Fail:
+        write_wav(pcm, rate, tmp)
+        try:
+            ffmpeg = media.find_ffmpeg()
+            r = subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(tmp), str(out)],
+                               capture_output=True, stdin=subprocess.DEVNULL)
+            if r.returncode == 0:
+                return out
+        except Fail:
+            pass
+        wav = free_path(out.with_suffix(".wav"))
+        os.replace(tmp, wav)
         return wav
-    r = subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(wav), str(out)],
-                       capture_output=True, stdin=subprocess.DEVNULL)
-    if r.returncode != 0:
-        return wav
-    wav.unlink(missing_ok=True)
-    return out
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------- tools: Gemini
@@ -439,10 +550,9 @@ async def gemini_consult(prompt: str, file_paths: list[str] | None = None,
     use = model or CONSULT_MODEL
     res = await anyio.to_thread.run_sync(
         run_agy, session_context(s) + body, use, [f if f.is_dir() else f.parent for f in files])
-    s.turns.append(Turn(tool="gemini_consult", at=now(), prompt=prompt, response=res["response"],
-                        files=[str(f) for f in files], model=use,
-                        agy_conversation_id=res["conversation_id"]))
-    save_session(s)
+    turn = Turn(tool="gemini_consult", at=now(), prompt=prompt, response=res["response"],
+                files=[str(f) for f in files], model=use, agy_conversation_id=res["conversation_id"])
+    update_session(s, lambda x: x.turns.append(turn))
     return {"session_id": s.session_id, "model": use, "seconds": res["seconds"],
             "response": clip(res["response"], RESPONSE_CHARS), **with_denied(res)}
 
@@ -466,10 +576,16 @@ async def gemini_analyze_media(file_path: str, prompt: str, session_id: str | No
             f"Open {'each' if len(files) > 1 else 'it'} once with your file-reading tool, then do this:\n\n{prompt}")
     use = model or MEDIA_MODEL
     res = await anyio.to_thread.run_sync(run_agy, session_context(s) + body, use, [f.parent for f in files])
-    s.turns.append(Turn(tool="gemini_analyze_media", at=now(), prompt=prompt, response=res["response"],
-                        files=[str(f) for f in files], model=use, agy_conversation_id=res["conversation_id"]))
-    s.media.append(MediaNote(file=str(files[0]), more_files=[str(f) for f in files[1:]], prompt=prompt, summary=clip(res["response"], SUMMARY_CHARS), at=now()))
-    save_session(s)
+    turn = Turn(tool="gemini_analyze_media", at=now(), prompt=prompt, response=res["response"],
+                files=[str(f) for f in files], model=use, agy_conversation_id=res["conversation_id"])
+    note = MediaNote(file=str(files[0]), more_files=[str(f) for f in files[1:]], prompt=prompt,
+                     summary=clip(res["response"], SUMMARY_CHARS), at=now())
+
+    def change(x: Session) -> None:
+        x.turns.append(turn)
+        x.media.append(note)
+
+    update_session(s, change)
     return {"session_id": s.session_id, "model": use, "seconds": res["seconds"],
             "files": [str(f) for f in files], "response": clip(res["response"], RESPONSE_CHARS),
             **with_denied(res)}
@@ -528,13 +644,18 @@ async def gemini_generate_image(prompt: str, output_path: str, session_id: str |
         ctx = session_context(s).replace("## New request\n", "## Image to make now\n")
     fn = _generate_image_agy if backend == "agy" else _generate_image_api
     saved, note, usage, used = await anyio.to_thread.run_sync(fn, prompt, out, ctx)
-    s.artifacts.append(Artifact(kind="image", path=str(saved), prompt=prompt, model=used, at=now(), usage=usage))
-    s.turns.append(Turn(tool="gemini_generate_image", at=now(), prompt=prompt, response=note,
-                        files=[str(saved)], model=used))
-    save_session(s)
+    art = Artifact(kind="image", path=str(saved), prompt=prompt, model=used, at=now(), usage=usage)
+    turn = Turn(tool="gemini_generate_image", at=now(), prompt=prompt, response=note,
+                files=[str(saved)], model=used)
+
+    def change(x: Session) -> None:
+        x.artifacts.append(art)
+        x.turns.append(turn)
+
+    latest = update_session(s, change)
     return {"session_id": s.session_id, "path": str(saved), "model": used, "backend": backend,
             "model_note": clip(note, 1000), "usage": usage,
-            "history": [a.path for a in s.artifacts if a.kind == "image"]}
+            "history": [a.path for a in latest.artifacts if a.kind == "image"]}
 
 
 def _generate_audio(text: str, voice: str, out: Path) -> tuple[Path, float, dict | None]:
@@ -575,11 +696,15 @@ async def gemini_generate_audio(text: str, output_path: str, voice_name: str = "
     s = open_session(session_id, text)
     out = output_file(output_path)
     saved, seconds, usage = await anyio.to_thread.run_sync(_generate_audio, text, voice_name, out)
-    s.artifacts.append(Artifact(kind="audio", path=str(saved), prompt=text, model=TTS_MODEL,
-                                at=now(), usage=usage))
-    s.turns.append(Turn(tool="gemini_generate_audio", at=now(), prompt=text,
-                        response=f"voice {voice_name}, {seconds} s", files=[str(saved)], model=TTS_MODEL))
-    save_session(s)
+    art = Artifact(kind="audio", path=str(saved), prompt=text, model=TTS_MODEL, at=now(), usage=usage)
+    turn = Turn(tool="gemini_generate_audio", at=now(), prompt=text,
+                response=f"voice {voice_name}, {seconds} s", files=[str(saved)], model=TTS_MODEL)
+
+    def change(x: Session) -> None:
+        x.artifacts.append(art)
+        x.turns.append(turn)
+
+    update_session(s, change)
     return {"session_id": s.session_id, "path": str(saved), "seconds": seconds,
             "voice_name": voice_name, "model": TTS_MODEL, "usage": usage}
 
@@ -603,21 +728,25 @@ async def gemini_review(repo: str, base: str | None = None, commit: str | None =
     """
     target = f"commit {commit}" if commit else f"branch vs {base}" if base else \
         "staged changes" if staged else "uncommitted changes"
+    s = open_session(session_id, f"review {target} in {repo}")  # before minutes of work
     work = work_dir("review", out_dir, session_id)
     result = await anyio.to_thread.run_sync(lambda: review_mod.review(
         repo, base=base, commit=commit, staged=staged, intent=intent, models=models, out=work,
         allow_secret_like=allow_secret_like))
     if result.get("status") == "STOPPED":
         return result
-    s = open_session(session_id, f"review {target} in {repo}")
     lines = [f"- [{g['severity']}] {g['file']}:{g['line']} (agreed {g['agreed']}): "
              f"{g['items'][0].get('summary', '')}" for g in result["findings"]]
-    s.turns.append(Turn(tool="gemini_review", at=now(), prompt=f"review {target} in {repo}",
-                        response="\n".join(lines) or "no findings", files=[result["review_file"]],
-                        model=", ".join(m["model"] for m in result["models"])))
-    s.artifacts.append(Artifact(kind="review", path=result["review_file"], prompt=target, at=now(),
-                                model=", ".join(m["model"] for m in result["models"])))
-    save_session(s)
+    used = ", ".join(m["model"] for m in result["models"])
+    turn = Turn(tool="gemini_review", at=now(), prompt=f"review {target} in {repo}",
+                response="\n".join(lines) or "no findings", files=[result["review_file"]], model=used)
+    art = Artifact(kind="review", path=result["review_file"], prompt=target, at=now(), model=used)
+
+    def change(x: Session) -> None:
+        x.turns.append(turn)
+        x.artifacts.append(art)
+
+    update_session(s, change)
     return {"session_id": s.session_id, **result}
 
 
@@ -650,6 +779,7 @@ async def media_clip(video_path: str, start: float, end: float, out_path: str | 
 
     30-60 s clips work best (e.g. to check whether BGM suits a scene). Local ffmpeg; no model.
     """
+    require_session(session_id)
     out = output_file(out_path) if out_path else work_dir("clip", None, session_id) / "clip.mp4"
     r = await anyio.to_thread.run_sync(lambda: media.cut_clip(video_path, out, start, end, height, fps, audio))
     record(session_id, "clip", r["path"], f"clip {start}-{end} s of {video_path}")
@@ -667,6 +797,7 @@ async def media_frames(video_path: str, start: float = 0.0, end: float | None = 
     sheet: also tile all frames into sheet.png. Read the frames yourself, or pass a few to
     gemini_analyze_media (more_files). Check positions afterwards with media_overlay.
     """
+    require_session(session_id)
     out = work_dir("frames", out_dir, session_id)
     r = await anyio.to_thread.run_sync(lambda: media.frames(video_path, out, start, end, fps, crop, grid, sheet))
     record(session_id, "frames", r["index"], f"frames {start}-{end} s of {video_path}")
@@ -684,6 +815,7 @@ async def media_audio(src_path: str, start: float = 0.0, end: float | None = Non
     spans in source seconds; silences match utterance breaks closely, so use these spans for exact
     times rather than the times a model reports.
     """
+    require_session(session_id)
     out = work_dir("audio", out_dir, session_id)
     r = await anyio.to_thread.run_sync(
         lambda: media.audio(src_path, out, start, end, silence_db, silence_min))
@@ -702,6 +834,7 @@ async def media_mix_balance(mix_path: str, voice_path: str, start: float = 0.0, 
     keep BGM 12-20 dB under the voice. Use this, not a model's ear, to judge BGM volume.
     Heavy EQ / reverb on the voice makes the BGM estimate too high. Per-window rows go to a JSON file.
     """
+    require_session(session_id)
     out = output_file(out_path) if out_path else work_dir("balance", None, session_id) / "balance.json"
     r = await anyio.to_thread.run_sync(lambda: measure.mix_balance(
         mix_path, voice_path, start, end, voice_start, win, min_db, out))
@@ -720,6 +853,7 @@ async def media_track(video_path: str, start: float, end: float, box: str, out_p
     Good for UI, cursors, captions, small units; weak when effects cover the object (then take
     keyframes with gemini_analyze_media instead). Check the result with media_overlay.
     """
+    require_session(session_id)
     out = output_file(out_path) if out_path else work_dir("track", None, session_id) / "track.json"
     r = await anyio.to_thread.run_sync(lambda: measure.track(
         video_path, start, end, box, out, search, every, update, hold))
@@ -729,17 +863,20 @@ async def media_track(video_path: str, start: float, end: float, box: str, out_p
 
 @mcp.tool()
 async def media_overlay(index_path: str, track_paths: list[str] | None = None,
-                        points: list[list[dict[str, Any]]] | None = None, out_path: str | None = None,
+                        points: list[list[dict[str, Any]] | dict[str, Any]] | None = None,
+                        out_path: str | None = None,
                         space: Literal["video", "image"] = "video", zoom: str | None = None,
                         cols: int = 4, width: int = 600, session_id: str | None = None) -> dict:
     """Draw positions on the frames from media_frames and tile them into one image to check by eye.
 
     index_path: the index.json from media_frames. Tracks come from track_paths (JSON files with a
-    "track" list, e.g. from media_track) and/or points (inline lists, e.g. what Gemini answered):
-    each point is {"frame": "f_001.png", "x": .., "y": ..} or {"t": seconds, "x": .., "y": ..}.
-    Each track gets its own colour. space: "video" (source pixels) or "image" (cropped-frame pixels).
+    "track" list, e.g. from media_track) and/or points: each entry is one track, either a list of
+    points or Gemini's answer as is ({"track": [...]}). A point is {"frame": "f_001.png", "x": ..,
+    "y": ..} or {"t": seconds, "x": .., "y": ..}. Each track gets its own colour.
+    space: "video" (source pixels) or "image" (cropped-frame pixels).
     zoom: "X:Y:W:H" region of each frame to keep. Read the returned image to judge the positions.
     """
+    require_session(session_id)
     tracks: list = list(track_paths or []) + list(points or [])
     out = output_file(out_path) if out_path else work_dir("overlay", None, session_id) / "check.png"
     r = await anyio.to_thread.run_sync(lambda: media.overlay(index_path, tracks, out, space, zoom, cols, width))

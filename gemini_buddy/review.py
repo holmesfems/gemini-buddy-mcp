@@ -34,11 +34,16 @@ SECRET_PATHS = [
         "**/*credentials*.json", "**/secrets.*", "**/*.secret",
     )
 ]
+_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+VAR_REF = (r"(?!(?:\$" + _NAME + r"|\$\{" + _NAME + r"\}|\$env:" + _NAME + r"|%" + _NAME + r"%)['\"])")
 SECRET_LINE = re.compile(
     r"(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{35}|ghp_[0-9A-Za-z]{36}|github_pat_[0-9A-Za-z_]{40,}"
     r"|sk-[A-Za-z0-9_\-]{20,}|xox[abprs]-[0-9A-Za-z\-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----"
     # api_key = "…" / "api_key": "…" / 'password': '…' / token: "…"
-    r"|(?i:(api[_-]?key|secret|token|password)['\"]?\s*[:=]\s*['\"][^'\"\s]{12,}['\"]))"
+    # but not when the whole value is a reference to a variable ("$API_KEY", "${API_KEY}",
+    # "$env:API_KEY", "%API_KEY%"), which holds no value itself. Values that only start with
+    # $ or % ("$2b$12$..." hashes, "%2F..." encoded tokens) still count.
+    r"|(?i:(api[_-]?key|secret|token|password)['\"]?\s*[:=]\s*['\"]" + VAR_REF + r"[^'\"\s]{12,}['\"]))"
 )
 
 SCHEMA = {

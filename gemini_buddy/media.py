@@ -112,6 +112,13 @@ def parse_box(text: str, n: int, sep: str, what: str) -> list[int]:
     return vals
 
 
+def frame_number(path: Path) -> int:
+    try:
+        return int(path.stem.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return 10 ** 9
+
+
 def frames(video: str, out: Path, start: float = 0.0, end: float | None = None, fps: float = 2.0,
            crop: str | None = None, grid: int = 0, sheet: bool = False) -> dict:
     """Still frames of a range plus index.json (each frame's time in the source and the crop offset)."""
@@ -130,7 +137,8 @@ def frames(video: str, out: Path, start: float = 0.0, end: float | None = None, 
         vf.append(f"crop={cw}:{ch}:{cx}:{cy}")
     ff_run([ff, "-hide_banner", "-loglevel", "error", "-y", *time_range(start, end), "-i", str(src),
             "-vf", ",".join(vf), str(fdir / "f_%03d.png")])
-    files = sorted(fdir.glob("f_*.png"))
+    # by number: past 999 frames ffmpeg writes f_1000.png, which sorts before f_101.png as text
+    files = sorted(fdir.glob("f_*.png"), key=frame_number)
     if not files:
         raise Fail("no frames were written; is the range inside the video?")
     if grid:

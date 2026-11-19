@@ -81,22 +81,25 @@ python -m venv .venv
 venv の中の実行ファイルを指定します（パスは clone した場所に合わせてください）。`--scope user` にすると、どのプロジェクトからも使えます。
 
 ```powershell
-claude mcp add gemini-buddy --scope user -e GEMINI_API_KEY=$env:GEMINI_API_KEY -- "C:\path\to\gemini-buddy-mcp\.venv\Scripts\gemini-buddy-mcp.exe"
+claude mcp add gemini-buddy --scope user -- "C:\path\to\gemini-buddy-mcp\.venv\Scripts\gemini-buddy-mcp.exe"
 ```
 
 macOS / Linux：
 
 ```bash
-claude mcp add gemini-buddy --scope user -e GEMINI_API_KEY="$GEMINI_API_KEY" -- /path/to/gemini-buddy-mcp/.venv/bin/gemini-buddy-mcp
+claude mcp add gemini-buddy --scope user -- /path/to/gemini-buddy-mcp/.venv/bin/gemini-buddy-mcp
 ```
 
 uv を使うなら、clone せずに：
 
 ```bash
-claude mcp add gemini-buddy --scope user -e GEMINI_API_KEY="$GEMINI_API_KEY" -- uvx --from "gemini-buddy-mcp[media] @ git+https://github.com/holmesfems/gemini-buddy-mcp" gemini-buddy-mcp
+claude mcp add gemini-buddy --scope user -- uvx --from "gemini-buddy-mcp[media] @ git+https://github.com/holmesfems/gemini-buddy-mcp" gemini-buddy-mcp
 ```
 
-- API での生成を使わないなら `-e GEMINI_API_KEY=...` は省けます（ほかはすべて agy のログインとローカルで動きます）。
+**API キー**（API での画像生成・TTS に使う。ほかのツールは agy のログインとローカルだけで動く）：
+
+- `GEMINI_API_KEY` は、ユーザーの環境変数に入れておけばサーバーがそのまま引き継ぎます（Windows なら「環境変数を編集」で、ユーザー環境変数に追加）。キーを入れたあとは Claude Code（デスクトップアプリならアプリごと）を起動し直してください。起動中のプロセスには新しい環境変数が届きません。
+- `claude mcp add` に `-e GEMINI_API_KEY=$env:GEMINI_API_KEY` を付ける書き方は勧めません。キーの値が `~/.claude.json` に平文で残るうえ、そのシェルにキーがまだ無いと**空の値で登録されてしまいます**（その場合、生成ツールは「set but empty」というエラーを返します）。
 - agy の答えは 10 秒〜数分かかります（コードレビューは 1 モデルで 2〜4 分）。Claude Code 側が先に打ち切るときは、起動前に `MCP_TOOL_TIMEOUT`（ミリ秒）を長めにしてください。
 
 ## 設定（環境変数）
