@@ -33,6 +33,70 @@ class Base(unittest.TestCase):
 
 
 class SessionTests(Base):
+    def turn(self, text):
+        return server.Turn(tool="gemini_consult", at=server.now(), prompt=text)
+
+    def test_stale_copy_does_not_drop_what_others_saved(self):
+        s = server.open_session(None, "first")
+        server.save_session(s)
+        stale = server.open_session(s.session_id, "")           # call A loads, then waits on a model
+        other = server.open_session(s.session_id, "")           # call B loads and saves first
+        server.update_session(other, lambda x: x.turns.append(self.turn("B")))
+        server.update_session(stale, lambda x: x.turns.append(self.turn("A")))
+        saved = server.open_session(s.session_id, "")
+        self.assertEqual([t.prompt for t in saved.turns], ["B", "A"])
+
+    def test_parallel_updates_all_land(self):
+        import threading
+        s = server.open_session(None, "first")
+        server.save_session(s)
+        threads = [threading.Thread(target=server.update_session,
+                                    args=(s, lambda x, i=i: x.turns.append(self.turn(str(i)))))
+                   for i in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        saved = server.open_session(s.session_id, "")
+        self.assertEqual(sorted(t.prompt for t in saved.turns), sorted(str(i) for i in range(12)))
+
+    def test_leftover_lock_file_does_not_block(self):
+        """A crashed process leaves the file but not the OS lock."""
+        s = server.open_session(None, "first")
+        lock = server.session_path(s.session_id).with_suffix(".lock")
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("left over")
+        with mock.patch.object(server, "LOCK_WAIT", 0.5):
+            server.update_session(s, lambda x: x.turns.append(self.turn("x")))
+        self.assertEqual(len(server.open_session(s.session_id, "").turns), 1)
+
+    def test_busy_lock_waits_then_fails_with_a_message(self):
+        import threading
+        s = server.open_session(None, "first")
+        held, release = threading.Event(), threading.Event()
+
+        def holder():
+            with server.session_lock(s.session_id):
+                held.set()
+                release.wait(5)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        held.wait(5)
+        try:
+            with mock.patch.object(server, "LOCK_WAIT", 0.3), self.assertRaises(server.Fail) as e:
+                server.update_session(s, lambda x: None)
+            self.assertIn("busy", str(e.exception))
+        finally:
+            release.set()
+            t.join()
+        server.update_session(s, lambda x: x.turns.append(self.turn("after")))  # free again
+        self.assertEqual(len(server.open_session(s.session_id, "").turns), 1)
+
+    def test_work_dirs_never_collide(self):
+        dirs = {server.work_dir("frames", None, None) for _ in range(20)}
+        self.assertEqual(len(dirs), 20)
+
     def test_rejects_non_uuid_ids(self):
         for bad in ("../../etc/passwd", "abc", ""):
             with self.assertRaises(server.Fail):
@@ -72,6 +136,26 @@ class AgyTests(Base):
         self.assertNotIn("--dangerously-skip-permissions", cmd)
         self.assertEqual(cmd.count("--add-dir"), 2)
         self.assertIn("json", cmd)
+
+    def test_agy_runs_in_an_empty_folder_not_the_servers(self):
+        with mock.patch("subprocess.run", return_value=fake_agy("ok")) as run:
+            server.run_agy("p", "m", [])
+        cwd = Path(run.call_args.kwargs["cwd"])
+        self.assertEqual(cwd, self.root / "home" / "agy-cwd")
+        self.assertNotEqual(cwd.resolve(), Path.cwd().resolve())
+
+    def test_unknown_session_fails_before_a_review(self):
+        with mock.patch.object(server.review_mod, "review") as review:
+            with self.assertRaises(server.Fail):
+                asyncio.run(server.gemini_review(str(self.root), session_id=str(uuid.uuid4())))
+        review.assert_not_called()
+
+    def test_unknown_session_fails_before_media_work(self):
+        with mock.patch.object(server.media, "frames") as frames:
+            with self.assertRaises(server.Fail):
+                asyncio.run(server.media_frames("x.mp4", session_id=str(uuid.uuid4())))
+        frames.assert_not_called()
+        self.assertFalse((self.root / "home" / "work").exists())
 
     def test_parse_json_after_warning(self):
         self.assertEqual(server.parse_json_tail('warn\n{"a": 1}')["a"], 1)
@@ -148,8 +232,36 @@ class FileTests(Base):
 
     def test_generation_needs_api_key(self):
         with mock.patch.dict(os.environ, {"GEMINI_API_KEY": ""}):
-            with self.assertRaises(server.Fail):
+            with self.assertRaises(server.Fail) as e:
                 server.genai_client()
+        self.assertIn("set but empty", str(e.exception))
+        env = {k: v for k, v in os.environ.items() if k != "GEMINI_API_KEY"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(server.Fail) as e:
+                server.genai_client()
+        self.assertIn("is not set", str(e.exception))
+
+    def test_mp3_keeps_an_existing_wav_of_the_same_name(self):
+        try:
+            server.media.find_ffmpeg()
+        except server.Fail:
+            self.skipTest("no ffmpeg (pip install -e \".[media]\")")
+        mine = self.root / "narration.wav"
+        mine.write_bytes(b"my own recording")
+        out = server.write_audio(b"\0\0" * 2400, 24000, self.root / "narration.mp3")
+        self.assertEqual(out, self.root / "narration.mp3")
+        self.assertTrue(out.exists())
+        self.assertEqual(mine.read_bytes(), b"my own recording")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["narration.mp3", "narration.wav"])
+
+    def test_without_ffmpeg_the_wav_gets_a_free_name(self):
+        mine = self.root / "narration.wav"
+        mine.write_bytes(b"my own recording")
+        with mock.patch.object(server.media, "find_ffmpeg", side_effect=server.Fail("no ffmpeg")):
+            out = server.write_audio(b"\0\0" * 2400, 24000, self.root / "narration.mp3")
+        self.assertEqual(out.name, "narration-1.wav")
+        self.assertEqual(mine.read_bytes(), b"my own recording")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["narration-1.wav", "narration.wav"])
 
     def test_tts_uses_v1beta(self):
         """The stable v1 API rejects speech_config (400 'Unknown name speechConfig')."""

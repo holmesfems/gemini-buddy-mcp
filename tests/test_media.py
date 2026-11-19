@@ -109,6 +109,46 @@ class MediaTools(unittest.TestCase):
         with self.assertRaises(Fail):
             measure.track(str(self.video), 0, 1, "630,350,40,40", self.root / "t2.json")
 
+    def test_frames_sort_by_number_past_999(self):
+        names = ["f_1000.png", "f_101.png", "f_999.png", "f_100.png", "f_001.png"]
+        got = [p.name for p in sorted((Path(n) for n in names), key=media.frame_number)]
+        self.assertEqual(got, ["f_001.png", "f_100.png", "f_101.png", "f_999.png", "f_1000.png"])
+
+    def test_mix_balance_short_range_finds_a_late_voice(self):
+        # the voice starts 1 s into the mix; the range is 4 s (shorter than the 10 s search piece)
+        late = self.root / "late.wav"
+        ff("-i", str(self.voice), "-f", "lavfi", "-i", "anoisesrc=color=pink:amplitude=0.02:duration=5",
+           "-filter_complex", "[0]adelay=1000[v];[v][1]amix=inputs=2:normalize=0:duration=longest",
+           "-ar", "16000", "-ac", "1", str(late))
+        r = measure.mix_balance(str(late), str(self.voice), start=0, end=4, voice_start=0)
+        self.assertAlmostEqual(r["voice_track_offset_s"], -1.0, delta=0.01)  # mix 1.0 s = voice 0.0 s
+        self.assertAlmostEqual(r["voice_gain"], 1.0, delta=0.05)
+        self.assertGreater(r["mean_voice_minus_bgm_db"], 20)
+        self.assertIn("at mix time t the voice track is at t + voice_track_offset_s", r["note"])
+
+    def test_mix_balance_short_files_without_voice_start(self):
+        # the mix starts 1 s into the 4 s voice track and is as long as it (4 s): with the whole
+        # mix as the search piece there was no room to slide it, so the offset was stuck at 0
+        early = self.root / "early.wav"
+        ff("-ss", "1", "-i", str(self.voice), "-f", "lavfi", "-i",
+           "anoisesrc=color=pink:amplitude=0.02:duration=4", "-filter_complex",
+           "[0][1]amix=inputs=2:normalize=0:duration=longest", "-ar", "16000", "-ac", "1", str(early))
+        r = measure.mix_balance(str(early), str(self.voice), start=0, end=4)
+        self.assertAlmostEqual(r["voice_track_offset_s"], 1.0, delta=0.01)  # mix 0 s = voice 1 s
+        self.assertAlmostEqual(r["voice_gain"], 1.0, delta=0.05)
+        self.assertGreater(r["mean_voice_minus_bgm_db"], 20)
+
+    def test_overlay_takes_geminis_answer_as_is(self):
+        """Through the MCP layer, so the argument types are checked as a client would send them."""
+        with mock.patch.dict(os.environ, {"GEMINI_BUDDY_HOME": str(self.root / "home2")}):
+            fr = media.frames(str(self.video), self.root / "fr2", start=0, end=1, fps=2)
+            answer = {"track": [{"frame": "f_001.png", "x": 120, "y": 170},
+                                {"frame": "f_002.png", "x": 140, "y": 170}]}
+            res = asyncio.run(server.mcp.call_tool("media_overlay", {"index_path": fr["index"],
+                                                                     "points": [answer]}))
+        text = res.content[0].text if hasattr(res, "content") else res[0][0].text
+        self.assertEqual(json.loads(text)["points_drawn"][0]["frames_with_point"], 2)
+
     def test_tools_record_into_a_session(self):
         with mock.patch.dict(os.environ, {"GEMINI_BUDDY_HOME": str(self.root / "home")}):
             s = server.open_session(None, "prep")
