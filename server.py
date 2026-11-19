@@ -319,12 +319,17 @@ def agy_images(conv_id: str, since: float) -> list[Path]:
 
 # ---------------------------------------------------------------- genai backend
 
-def genai_client():
+def genai_client(api_version: str | None = None):
+    """api_version: the SDK may default to the stable v1 API, which lacks some fields
+    (TTS's speech_config is only in v1beta)."""
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
         raise Fail("GEMINI_API_KEY is not set; API generation uses the API credit "
                    "(for images, backend='agy' uses the subscription instead)")
     from google import genai
+    if api_version:
+        from google.genai import types
+        return genai.Client(api_key=key, http_options=types.HttpOptions(api_version=api_version))
     return genai.Client(api_key=key)
 
 
@@ -534,7 +539,7 @@ async def gemini_generate_image(prompt: str, output_path: str, session_id: str |
 
 def _generate_audio(text: str, voice: str, out: Path) -> tuple[Path, float, dict | None]:
     from google.genai import types
-    client = genai_client()
+    client = genai_client("v1beta")
     try:
         resp = client.models.generate_content(
             model=TTS_MODEL, contents=text,
@@ -562,8 +567,10 @@ async def gemini_generate_audio(text: str, output_path: str, voice_name: str = "
     """Read text aloud with Gemini TTS (google-genai SDK, API credit) and save it to output_path.
 
     .wav is written directly; other extensions (.mp3, .m4a ...) are converted with ffmpeg when
-    available, otherwise a .wav next to it is returned. Style directions can go in the text
-    (e.g. "Say cheerfully: ..."). Returns the saved path and the length in seconds.
+    available, otherwise a .wav next to it is returned. Put only the words to be spoken in text:
+    gemini-3.8-flash-tts reads directions such as "Say cheerfully:" aloud. Choose the tone with
+    voice_name instead. Returns the saved path and the length in seconds; to check what was said,
+    pass the file to gemini_analyze_media.
     """
     s = open_session(session_id, text)
     out = output_file(output_path)

@@ -20,7 +20,7 @@ Claude Code などの MCP クライアントから Gemini を「相棒」とし�
 | `gemini_analyze_media(file_path, prompt, session_id?, model?, more_files?)` | agy | 動画・音声・画像を見て・聞いての文字起こし、話者分け、画面の動き、BGM が場面に合うか、おおよその座標。答えの要約をセッションに残す |
 | `gemini_review(repo, base?, commit?, staged?, intent?, models?, allow_secret_like?, session_id?, out_dir?)` | agy | git の差分を読むだけでレビュー。複数のモデルを並べると、同じ場所の指摘をまとめる |
 | `gemini_generate_image(prompt, output_path, session_id?, backend="api")` | API / agy | 画像を作って保存し、パスを返す。`backend="agy"` でサブスク（1 枚 50 秒ほど） |
-| `gemini_generate_audio(text, output_path, voice_name="Kore", session_id?)` | API | TTS で読み上げて保存し、パスと長さ（秒）を返す |
+| `gemini_generate_audio(text, output_path, voice_name="Kore", session_id?)` | API | TTS で読み上げて保存し、パスと長さ（秒）を返す。`text` には読む文だけを書く（「Say cheerfully:」のような指示も読み上げられる） |
 | `gemini_list_sessions(limit=20)` | — | 保存したセッションを新しい順に（`session_id`・更新日時・タイトル・関係するファイル） |
 
 ### ローカルの下ごしらえと計測（モデルは使わない）

@@ -151,6 +151,19 @@ class FileTests(Base):
             with self.assertRaises(server.Fail):
                 server.genai_client()
 
+    def test_tts_uses_v1beta(self):
+        """The stable v1 API rejects speech_config (400 'Unknown name speechConfig')."""
+        from google.genai import types
+        pcm = b"\0\0" * 2400
+        part = types.Part(inline_data=types.Blob(data=pcm, mime_type="audio/L16;codec=pcm;rate=24000"))
+        resp = types.GenerateContentResponse(candidates=[types.Candidate(content=types.Content(parts=[part]))])
+        with mock.patch("google.genai.Client") as client:
+            client.return_value.models.generate_content.return_value = resp
+            out, seconds, _ = server._generate_audio("hi", "Kore", self.root / "t.wav")
+        self.assertEqual(client.call_args.kwargs["http_options"].api_version, "v1beta")
+        self.assertEqual(seconds, 0.1)
+        self.assertTrue(out.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
