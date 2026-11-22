@@ -751,8 +751,10 @@ async def gemini_review(repo: str, base: str | None = None, commit: str | None =
     branch, commit="<sha>" for one commit, staged=True for staged changes.
     intent: what the change is meant to do, in the author's words (default: commit messages).
       Do not put your own review opinions here; the point is an independent second look.
-    models: agy models run in parallel (default gemini-4-neon-high; add gemini-4-hydrogen-high
-      for a fast second vote). Findings on the same place are merged; `agreed` = how many models.
+    models: agy models (default gemini-4-neon-high alone; another Gemini adds little next to
+      Claude). With several, findings on the same place are merged; `agreed` = how many models.
+    Findings come back as a list; `unparsed` holds any answer whose findings could not be read
+    as JSON: read it yourself.
     Secret-looking lines stop the run with status STOPPED and nothing is sent; show those lines to
     the user and pass allow_secret_like=True only if they say it is fine.
     Takes minutes. Findings are candidates: trace each one in the code before reporting it.
@@ -761,9 +763,10 @@ async def gemini_review(repo: str, base: str | None = None, commit: str | None =
         "staged changes" if staged else "uncommitted changes"
     s = open_session(session_id, f"review {target} in {repo}")  # before minutes of work
     work = work_dir("review", out_dir, session_id)
+    client = acp_client if agy_backend() == "acp" else None
     result = await anyio.to_thread.run_sync(lambda: review_mod.review(
         repo, base=base, commit=commit, staged=staged, intent=intent, models=models, out=work,
-        allow_secret_like=allow_secret_like))
+        allow_secret_like=allow_secret_like, client=client() if client else None))
     if result.get("status") == "STOPPED":
         return result
     lines = [f"- [{g['severity']}] {g['file']}:{g['line']} (agreed {g['agreed']}): "

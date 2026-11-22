@@ -1,9 +1,14 @@
 """Independent code review of a git diff by agy (Gemini), ported from agy-media's agy-review.
 
 Gemini is trained apart from Claude, so its blind spots differ. agy reads the diff (and the
-repository around it, read-only) and returns findings as JSON. With several models, findings
-that land on the same place are merged so you can see which ones more than one model agrees on.
-The answers are candidates, not verdicts: check each one in the code yourself.
+repository around it, read-only) and answers with findings as JSON. One model (Neon) is the
+default: a second Gemini adds little to a Claude + Gemini pair. With several models, findings that
+land on the same place are merged (`agreed`). The answers are candidates, not verdicts: check
+each one in the code yourself.
+
+Over ACP (the default) no schema is enforced: the prompt asks for the JSON and parse_answer
+finds it in the answer; when it cannot, the raw answer is returned (`unparsed`) for a reader.
+Over `agy -p` (GEMINI_BUDDY_AGY_BACKEND=cli) --json-schema enforces it.
 
 - agy runs in plan mode (read-only), without GEMINI_API_KEY / GOOGLE_API_KEY in its environment,
   and is told not to use a terminal, the web, or files outside the repository. It can still read
@@ -24,7 +29,7 @@ from types import SimpleNamespace
 from .agyproc import agy_env, agy_exe, decode, parse_json_tail
 from .errors import Fail
 
-# Neon finds the most (incl. subtle races). Add --model gemini-4-hydrogen-high for a fast second vote.
+# Neon found the most (incl. a real race the others missed) in agy-media's comparison.
 DEFAULT_MODELS = ["gemini-4-neon-high"]
 
 # left out of the diff sent to agy (case-insensitive: .ENV, Credentials.json, server.KEY ...)
@@ -191,7 +196,33 @@ def secret_like_lines(diff: str):
     return hits
 
 
-def run_model(model: str, prompt: str, repo: Path, work: Path, schema_path: Path, agy: str, timeout: int):
+def run_model_acp(client, model: str, prompt: str, repo: Path, work: Path, timeout: int):
+    """One model over ACP: plan mode, every permission request rejected (see acp.py)."""
+    from .acp import Timeout
+    t0 = time.time()
+    try:
+        res = client.prompt(prompt, model, repo, [repo, work], timeout)
+    except Timeout:
+        return {"model": model, "status": "TIMEOUT", "seconds": round(time.time() - t0, 1), "findings": []}
+    except Fail as e:
+        return {"model": model, "status": "ERROR", "error": str(e), "seconds": round(time.time() - t0, 1),
+                "findings": []}
+    response = res["response"]
+    data = parse_answer(response)
+    out = {"model": model, "seconds": res["seconds"], "status": "SUCCESS" if response else "ERROR",
+           "conversation_id": res["conversation_id"], "denied_actions": res["denied_actions"],
+           "findings": clean_findings((data or {}).get("findings")),
+           "notes": (data or {}).get("notes") if isinstance((data or {}).get("notes"), str) else "",
+           "structured": data is not None, "usage": res["usage"]}
+    if data is None:
+        out["response"] = response[-6000:]
+    return out
+
+
+def run_model(model: str, prompt: str, repo: Path, work: Path, schema_path: Path, agy: str, timeout: int,
+              client=None):
+    if client is not None:
+        return run_model_acp(client, model, prompt, repo, work, timeout)
     cmd = [agy, "-p", prompt, "--model", model, "--mode", "plan", "--output-format", "json",
            "--json-schema", str(schema_path), "--print-timeout", f"{timeout}s",
            "--add-dir", str(repo), "--add-dir", str(work)]
@@ -261,8 +292,11 @@ def merge(results, near: int):
 def review(repo: str = ".", base: str | None = None, commit: str | None = None, staged: bool = False,
            intent: str | None = None, models: list[str] | None = None, out: Path | None = None,
            near: int = 3, max_diff_kb: int = 400, allow_secret_like: bool = False,
-           timeout: int = 900) -> dict:
-    """Build the diff, run each model (in parallel), merge the findings, write review.json into `out`."""
+           timeout: int = 900, client=None) -> dict:
+    """Build the diff, run each model (in parallel), merge the findings, write review.json into `out`.
+
+    client: an acp.AcpClient to ask over ACP; None runs `agy -p` with --json-schema.
+    """
     if sum(bool(x) for x in (base, commit, staged)) > 1:
         raise Fail("give only one of base, commit, staged")
     root = Path(git(Path(repo).expanduser(), "rev-parse", "--show-toplevel").strip()).resolve()
@@ -292,7 +326,7 @@ def review(repo: str = ".", base: str | None = None, commit: str | None = None, 
     use = list(dict.fromkeys(models or DEFAULT_MODELS))  # same model twice would overwrite its result file
     agy = agy_exe()
     with ThreadPoolExecutor(max_workers=len(use)) as ex:
-        results = list(ex.map(lambda m: run_model_safe(m, prompt, root, work, schema_path, agy, timeout), use))
+        results = list(ex.map(lambda m: run_model_safe(m, prompt, root, work, schema_path, agy, timeout, client), use))
     for r in results:
         name = re.sub(r"[^A-Za-z0-9._-]", "_", r["model"])
         (work / f"result_{name}.json").write_text(json.dumps(r, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -309,6 +343,9 @@ def review(repo: str = ".", base: str | None = None, commit: str | None = None, 
         "agreed_by_2plus": sum(g["agreed"] >= 2 for g in groups),
         "notes": {r["model"]: r.get("notes", "") for r in results if r.get("notes")},
     }
+    unparsed = {r["model"]: r["response"] for r in results if r.get("response")}
+    if unparsed:  # answers with no findings JSON in them: read these yourself
+        summary["unparsed"] = unparsed
     (work / "review.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     summary["review_file"] = str(work / "review.json")
     return summary

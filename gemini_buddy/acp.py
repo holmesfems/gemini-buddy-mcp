@@ -37,6 +37,10 @@ LOGIN_HINT = ("agy is not signed in for ACP. Run `agy acp --login` once in a ter
               "(it opens a Google sign-in), then call again.")
 
 
+class Timeout(Fail):
+    """The prompt ran past its time limit (the session was cancelled)."""
+
+
 class RpcError(Exception):
     def __init__(self, method: str, error: dict):
         self.method, self.error = method, error
@@ -96,6 +100,7 @@ class AcpClient:
         self._turns: dict[str, _Turn] = {}
         self.agent_info: dict = {}
         self.tier: str | None = None
+        self._reader_done = threading.Event()
 
     # ------------------------------------------------------------ process
 
@@ -129,12 +134,16 @@ class AcpClient:
                 raise Fail(f"{LOGIN_HINT} ({e})")
             tier = ((auth or {}).get("_meta") or {}).get("antigravity", {}).get("tier")
             self.tier = tier.get("name") if isinstance(tier, dict) else None
+        except (RpcError, TimeoutError, AttributeError) as e:
+            self.close()
+            raise Fail(f"agy acp did not start: {e}. Its log: {self.log_path}")
         except BaseException:
             self.close()
             raise
 
     def alive(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
+        """The process runs and we still read its output (a reader that stopped means no replies)."""
+        return self.proc is not None and self.proc.poll() is None and not self._reader_done.is_set()
 
     def close(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
@@ -168,7 +177,7 @@ class AcpClient:
             try:
                 self.proc.stdin.write(data)
                 self.proc.stdin.flush()
-            except OSError as e:
+            except (OSError, ValueError) as e:   # ValueError: another thread closed the pipe
                 raise Fail(f"agy acp closed its input: {e}")
 
     def request(self, method: str, params: dict, timeout: float = RPC_TIMEOUT) -> Any:
@@ -202,8 +211,14 @@ class AcpClient:
                 except ValueError:
                     continue   # not ours (a stray log line)
                 if isinstance(msg, dict):
-                    self._dispatch(msg)
+                    try:
+                        self._dispatch(msg)
+                    except Exception:  # noqa: BLE001 - one odd message must not stop the reader
+                        continue
+        except (OSError, ValueError):
+            pass   # pipe closed
         finally:
+            self._reader_done.set()
             self._fail_pending("agy acp exited")
 
     def _dispatch(self, msg: dict) -> None:
@@ -215,7 +230,9 @@ class AcpClient:
                 pending.msg = msg
                 pending.event.set()
             return
-        params = msg.get("params") or {}
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            params = {}
         with self._lock:
             turn = self._turns.get(params.get("sessionId"))
         if "id" not in msg:  # a notification
@@ -242,8 +259,11 @@ class AcpClient:
         extra = list(dict.fromkeys(str(d) for d in dirs))
         if extra:
             params["additionalDirectories"] = extra
-        session = self.request("session/new", params)
-        sid = session["sessionId"]
+        try:
+            session = self.request("session/new", params)
+            sid = session["sessionId"]
+        except (RpcError, TimeoutError, TypeError, KeyError) as e:
+            raise Fail(f"agy acp could not open a session: {e}")
         turn = _Turn()
         with self._lock:
             self._turns[sid] = turn
@@ -255,8 +275,8 @@ class AcpClient:
                     "sessionId": sid, "prompt": [{"type": "text", "text": text}]}, timeout)
             except TimeoutError:
                 self.notify("session/cancel", {"sessionId": sid})
-                raise Fail(f"agy did not finish within {timeout:.0f} s (cancelled)")
-        except RpcError as e:
+                raise Timeout(f"agy did not finish within {timeout:.0f} s (cancelled)")
+        except (RpcError, TimeoutError) as e:   # set_mode failing means we never prompt outside plan
             raise Fail(f"agy acp failed: {e}")
         finally:
             with self._lock:

@@ -93,10 +93,46 @@ class AcpOk(AcpBase):
 
     def test_restarts_after_the_process_dies(self):
         server.run_agy("hi", "m", [])
-        server.acp_client().proc.kill()
-        server.acp_client().proc.wait(5)
+        proc = server.acp_client().proc   # one handle: a second acp_client() could restart it
+        proc.kill()
+        proc.wait(5)
         self.assertEqual(server.run_agy("hi", "m", [])["response"][:5], "こんにちは")
         self.assertEqual(len(self.sent("initialize")), 2)
+
+
+class AcpReview(AcpBase):
+    def make_repo(self):
+        import subprocess
+        repo = self.root / "repo"
+        repo.mkdir()
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", *a],  # noqa: E731
+                                        check=True, capture_output=True)
+        git("init", "-q")
+        (repo / "a.py").write_text("def add(a, b):\n    return a + b\n")
+        git("add", ".")
+        git("commit", "-qm", "init")
+        (repo / "a.py").write_text("def add(a, b):\n    return a - b\n")
+        return repo
+
+    def test_review_over_acp_reads_json_from_the_answer(self):
+        repo = self.make_repo()
+        with mock.patch("subprocess.run", wraps=__import__("subprocess").run) as run:
+            r = asyncio.run(server.gemini_review(str(repo), out_dir=str(self.root / "out")))
+        self.assertFalse([c for c in run.call_args_list if "-p" in (c.args[0] if c.args else [])])
+        self.assertEqual(r["status"], "SUCCESS")
+        self.assertEqual(r["findings"][0]["file"], "a.py")
+        self.assertEqual(r["models"][0]["structured"], True)
+        self.assertNotIn("unparsed", r)
+        new = self.sent("session/new")[0]["params"]
+        self.assertEqual(Path(new["cwd"]), repo.resolve())
+        self.assertNotIn("--json-schema", json.dumps(self.sent("session/prompt")))
+
+    def test_prose_answer_is_returned_unparsed(self):
+        repo = self.make_repo()
+        r = asyncio.run(server.gemini_review(str(repo), intent="PROSE please", out_dir=str(self.root / "out")))
+        self.assertEqual(r["findings"], [])
+        self.assertIn("引き算", r["unparsed"]["gemini-4-neon-high"])
+        self.assertEqual(r["models"][0]["structured"], False)
 
 
 class AcpNoAuth(AcpBase):
@@ -125,6 +161,26 @@ class AcpCrash(AcpBase):
     def test_crash_is_a_fail_not_a_hang(self):
         with self.assertRaises(server.Fail):
             server.run_agy("hi", "m", [])
+
+
+class AcpJunk(AcpBase):
+    mode = "junk"
+
+    def test_malformed_messages_do_not_stop_the_reader(self):
+        self.assertTrue(server.run_agy("hi", "m", [])["response"].startswith("こんにちは"))
+        self.assertTrue(server.acp_client().alive())
+        self.assertTrue(server.run_agy("hi", "m", [])["response"].startswith("こんにちは"))
+        self.assertEqual(len(self.sent("initialize")), 1)
+
+
+class AcpNoSession(AcpBase):
+    mode = "nosession"
+
+    def test_session_error_is_a_fail(self):
+        with self.assertRaises(server.Fail) as cm:
+            server.run_agy("hi", "m", [])
+        self.assertIn("could not open a session", str(cm.exception))
+        self.assertEqual(self.sent("session/prompt"), [])
 
 
 class BackendSetting(unittest.TestCase):

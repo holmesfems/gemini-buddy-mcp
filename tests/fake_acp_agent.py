@@ -5,6 +5,8 @@ FAKE_ACP_MODE picks the behaviour:
   noauth  fail `authenticate`
   hang    never answer session/prompt (until session/cancel)
   crash   exit in the middle of a prompt
+  junk    send malformed messages before answering a prompt
+  nosession  fail session/new
 Every request received is appended to FAKE_ACP_LOG (one JSON per line) when set.
 """
 import json
@@ -54,12 +56,25 @@ def handle_prompt(msg):
         return
     if MODE == "crash":
         os._exit(3)
+    if MODE == "junk":
+        send({"jsonrpc": "2.0", "method": "session/update", "params": [1, 2]})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": "x"}})
+        send({"jsonrpc": "2.0", "id": {"odd": 1}, "result": 5})
     if "PERMISSION" in text:
         r = ask_permission(sid)
         chosen = ((r or {}).get("result") or {}).get("outcome", {}).get("optionId")
         update(sid, {"sessionUpdate": "agent_message_chunk",
                      "content": {"type": "text", "text": f"permission={chosen} "}})
     update(sid, {"sessionUpdate": "tool_call", "name": "read_file", "kind": "read", "title": "Read x"})
+    if "Task: review" in text:
+        answer = ("Here is my review.\n```json\n" + json.dumps({"findings": [{
+            "file": "a.py", "line": 2, "severity": "high", "category": "correctness",
+            "summary": "引き算になっている", "failure_scenario": "add(1, 2) が -1", "confidence": 0.9}],
+            "notes": "ほかは問題なし"}, ensure_ascii=False) + "\n```"
+                  if "PROSE" not in text else "a.py の2行目が引き算になっています。")
+        update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": answer}})
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn"}})
+        return
     for part in ("こんにちは", "、", sid[:8]):
         update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": part}})
     send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "end_turn", "usage": {"totalTokens": 7}}})
@@ -88,6 +103,8 @@ for line in sys.stdin.buffer:
         else:
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "_meta": {"antigravity": {"tier": {"name": "Fake Pro"}}}}})
+    elif method == "session/new" and MODE == "nosession":
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "no workspace"}})
     elif method == "session/new":
         sessions += 1
         send({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": f"0000000{sessions}-aaaa-bbbb-cccc-dddddddddddd"}})
