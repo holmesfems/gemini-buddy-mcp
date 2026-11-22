@@ -1,6 +1,6 @@
 [project]
 name = "gemini-buddy-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Stdio MCP server that lets Claude consult Gemini (agy CLI, subscription), have it review diffs and analyse media, generate images / speech (google-genai, API credit), and prepare / measure media locally, with persistent sessions."
 readme = "README.md"
 license = "MIT"

@@ -7,6 +7,8 @@
 Claude Code などの MCP クライアントから Gemini を「相棒」として呼ぶための、stdio 型の MCP サーバーです。[agy-media](https://github.com/holmesfems/agy-media)（スキル版）の中身をすべて MCP のツールに移しました。
 
 - **相談・メディア解析・コードレビュー**：本サーバーが、サブスクでログイン済みの [Antigravity CLI](https://antigravity.google/)（`agy`）をサブプロセスで実行します。子プロセスの環境変数から `GEMINI_API_KEY`・`GOOGLE_API_KEY` を削除するため、**API キーによる課金は発生しません**。
+  - `agy acp`（[Agent Client Protocol](https://agentclientprotocol.com/) のサーバー）を 1 つ起動したままにして、呼ぶたびに新しいセッションを開きます。`agy -p` を毎回起動するより 1 回あたり 2 秒ほど速く、サインインは `agy` のログイン（`oauth-personal`）をそのまま使います。
+  - `backend="agy"` の画像生成だけは、これまでどおり `agy -p` で実行します（理由は「安全のために」）。
 - **画像・音声の生成**：既定では `GEMINI_API_KEY` を使って `google-genai` SDK（API のクレジット枠）で実行します。画像生成のみ、`backend="agy"` を指定することで `agy` 組み込みの画像生成（サブスク枠）も使用できます。
 - **機械的な下ごしらえと計測（ローカル実行）**：AI モデルを使わずローカルで処理します（ffmpeg での切り出し・コマ画像化・座標の目盛り、無音区間・ラウドネス・スペクトログラム、声と BGM の音量差、OpenCV での追跡、座標の描き込み確認）。
 - **セッション管理**：どのツールも `session_id` を受け取れます。会話・解析したメディアの要約・生成したファイルの記録は `~/.gemini-buddy-mcp/sessions/<session_id>.json` に保存され、同じ `session_id` を渡すことで続きから依頼できます。
@@ -22,7 +24,7 @@ Claude Code などの MCP クライアントから Gemini を「相棒」とし�
 |---|---|---|
 | `gemini_consult(prompt, file_paths?, session_id?, model?)` | agy | コードや設計のセカンドオピニオン。`file_paths` で渡したファイルは Gemini が自分で開いて読む |
 | `gemini_analyze_media(file_path, prompt, session_id?, model?, more_files?)` | agy | 動画・音声・画像を見て・聞いての文字起こし、話者分け、画面の動き、BGM が場面に合うか、おおよその座標。回答の要約をセッションに保存する |
-| `gemini_review(repo, base?, commit?, staged?, intent?, models?, allow_secret_like?, session_id?, out_dir?)` | agy | git の差分を読み取り専用でレビューする。複数のモデルを指定した場合、同じ箇所への指摘をまとめる |
+| `gemini_review(repo, base?, commit?, staged?, intent?, models?, allow_secret_like?, session_id?, out_dir?)` | agy | git の差分を読み取り専用でレビューする。既定は Neon 1 モデル（Claude と組むなら、別の Gemini を足しても視点はあまり広がらない）。複数のモデルを指定した場合、同じ箇所への指摘をまとめる。答えから指摘の JSON を読めなかったときは、答えの文を `unparsed` で返す |
 | `gemini_generate_image(prompt, output_path, session_id?, backend="api")` | API / agy | 画像を生成・保存し、ファイルパスを返す。`backend="agy"` を指定するとサブスク枠を使用（1 枚あたり 50 秒ほど） |
 | `gemini_generate_audio(text, output_path, voice_name="Kore", session_id?)` | API | TTS で音声を生成・保存し、ファイルパスと長さ（秒）を返す。**`text` には読み上げる本文のみを書く**（「Say cheerfully:」のような指示文を書くと、その指示文自体も読み上げられる） |
 | `gemini_list_sessions(limit=20)` | — | 保存したセッションを新しい順に一覧表示する（`session_id`・更新日時・タイトル・関係するファイル） |
@@ -75,6 +77,7 @@ MCP クライアント（Claude など）および人間は、`agy`（Gemini）�
 
 - Python 3.10+
 - `agy`（インストールおよびログイン済みであること。`agy models` を実行してモデル一覧が表示されること）
+  - ACP でサインインできないと言われたら、ターミナルで一度 `agy acp --login` を実行してください（Google のサインインが開きます）。`agy acp` の標準エラーは `~/.gemini-buddy-mcp/agy-acp.log` に出ます。
 - `GEMINI_API_KEY`（API 枠で画像生成・TTS を使う場合のみ必要）
 - Pillow・numpy・OpenCV・ffmpeg（ローカルのツールに必要。`[media]` オプションでインストールされる。PATH 上に `ffmpeg` がない場合は、自動で `imageio-ffmpeg` 同梱のものを使用する）
 - git（`gemini_review` に必要）
@@ -131,7 +134,7 @@ API 枠の画像生成・TTS 以外のツールは、`agy` のログインとロ
 
 ### タイムアウトの設定
 
-`agy` の応答には 10 秒〜数分かかります（コードレビューは 1 モデルあたり 2〜4 分）。Claude Code 側で先にタイムアウトする場合は、Claude Code の起動前に環境変数 `MCP_TOOL_TIMEOUT`（ミリ秒）を長めに設定してください。
+`agy` の応答には 10 秒〜数分かかります（コードレビューは 1 モデルあたり 2〜6 分）。Claude Code 側で先にタイムアウトする場合は、Claude Code の起動前に環境変数 `MCP_TOOL_TIMEOUT`（ミリ秒）を長めに設定してください。
 
 ## 設定（環境変数）
 
@@ -145,6 +148,7 @@ API 枠の画像生成・TTS 以外のツールは、`agy` のログインとロ
 | `GEMINI_BUDDY_TTS_MODEL` | `gemini-3.8-flash-tts` | API の読み上げモデル |
 | `GEMINI_BUDDY_AGY_TIMEOUT` | `600` | `agy` を待つ秒数（`gemini_review` は 1 モデルあたり 900 秒） |
 | `GEMINI_BUDDY_AGY` | PATH の `agy` | `agy` の実行ファイル |
+| `GEMINI_BUDDY_AGY_BACKEND` | `acp` | 相談・メディア解析・レビューの呼び方。`acp` = 起動したままの `agy acp`、`cli` = 毎回 `agy -p`（ACP で困ったときの戻し先。レビューは `--json-schema` で答えの形を強制する） |
 | `GEMINI_BUDDY_HOME` | `~/.gemini-buddy-mcp` | セッションと作業フォルダを置く場所 |
 | `AGY_BRAIN_DIR` | `~/.gemini/antigravity-cli/brain` | `agy` が画像を保存するフォルダ（`backend="agy"` で取り出す） |
 
@@ -171,10 +175,15 @@ API の画像生成または TTS がモデル ID の不一致で失敗した場�
 ## 安全のために
 
 - **`agy` の実行モードとアクセス範囲**：
-  - **通常時（相談・メディア解析・コードレビュー）**：本サーバーは `agy` を `--mode plan`（読み取り専用）で起動し、`--dangerously-skip-permissions` は付与しません。`agy` が読めるのは、渡したファイルのあるフォルダ（`--add-dir`）のみです。
-  - **例外（`backend="agy"` の画像生成）**：`agy` が自身の出力フォルダに画像を書き込めるよう `accept-edits` で起動し、ほかのファイルに触れないようプロンプトで指示します。
-- **ヘッドレス `agy` のコマンド実行制限**：
-  - ヘッドレス実行の `agy` はシェルコマンドを実行できません。MCP クライアント（またはユーザー）は、動画の切り出し等の前処理を事前に `media_*` ツールで済ませてから `agy` に渡してください。
+  - **通常時（相談・メディア解析・コードレビュー）**：本サーバーは `agy` を plan モード（読み取り専用）で動かし、`--dangerously-skip-permissions` は付与しません。`agy` が読めるのは、空の作業フォルダと、渡したファイルのあるフォルダ（`--add-dir`、ACP では `additionalDirectories`）のみです。
+  - **ACP（相談・メディア解析・レビュー）**：セッションは必ず plan モードで開き、`agy` から届く許可の求め（`session/request_permission`）はすべて断って `denied_actions` に記録します。ファイルの読み書き・端末の機能はクライアントとして提供しません。
+    - **plan モードに限る理由**：ACP の `default`・`accept-edits` モードでは、`agy` は自分の `settings.json` で許されたコマンド（`"toolPermission": "proceed-in-sandbox"` ならサンドボックス内のコマンド全般）を、許可を求めずに実行します（2026-11 の実測で `echo` が聞かれずに動いた）。plan モードではコマンドを実行せず、計画を書くだけでした。
+  - **例外（`backend="agy"` の画像生成）**：`agy -p` を `accept-edits` で、毎回使い捨ての空フォルダで起動します（そこに書かれたものが、ほかのセッションに見えないように）。ACP では画像生成がサブエージェントに回され、ターンが終わってから結果が返るので（完了の通知は来ない）、今は使いません。
+  - **`agy -p` の厳しい設定**：`agy -p` は毎回 `--settings` で `{"permissions": {"allow": [], "deny": ["command(*)", "write_file(*)"]}}` を渡し、ユーザーの `settings.json` の `allow` を打ち消します（`deny` が優先される）。画像生成は `write_file` を使わずに画像を保存するので、これで動きます。ACP（`agy acp`）には `--settings` が無いので、plan モードと許可の拒否で守ります。
+  - **コードレビュー**：ACP には `--json-schema` に当たる仕組みが無いので、プロンプトで JSON の形を頼み、答えの中から探して読みます（そのまま・```json の囲み・前置きのあと）。読めなかったときは答えの文を `unparsed` で返すので、MCP クライアントが読んでください。
+- **ヘッドレス `agy` のコマンド実行**：
+  - 本サーバーから呼ぶ `agy` はシェルコマンドを実行しません（上の厳しい設定と plan モード）。MCP クライアント（またはユーザー）は、動画の切り出し等の前処理を事前に `media_*` ツールで済ませてから `agy` に渡してください。
+  - **注意**：ヘッドレスの `agy -p` でも、`settings.json` の `allow` にあるコマンドは聞かれずに実行されます（2026-11、agy 1.5.14 の実測で `git status` が動いた）。以前この README に書いていた「ヘッドレスはコマンドを実行できない」は誤りでした。
   - 返り値に `denied_actions` が含まれている場合、`agy` が何らかのコマンドや操作を実行しようとして拒否された印です。
 - **`gemini_review` のデータ送信と秘密情報の保護**：
   - **外部送信の前提**：`gemini_review` に渡されたコードは Google に送信されます。
@@ -182,6 +191,7 @@ API の画像生成または TTS がモデル ID の不一致で失敗した場�
     - `.env`・鍵・`credentials` に該当するファイル（大文字・小文字を区別しない）は、自動で差分から除外します。
     - 差分のいずれかの行に API キーや秘密鍵らしい文字列を検知した場合、外部へ一切送信せず `STOPPED` を返します（`allow_secret_like` で明示的に許可しない限り）。
   - **ユーザー側で必要な追加対策（重要）**：`agy` プロセス自体はリポジトリ全体を読み取れます。リポジトリ内に秘密情報を含むファイルがある場合は、**ユーザー側で `agy` の `settings.json` の `deny` に読み取り拒否ルール（例：`read_file(regex:.*\.env.*)` など）を追加してください**。
+    - **副作用に注意**：agy 1.5.14 では、`deny` にこの `regex:` のルールがあると端末のサンドボックスが `deny regex:.*\.env.*: globs not supported` で起動できず、agy は `BypassSandbox` でサンドボックスの外でコマンドを実行し直しました（本サーバーの呼び出しはコマンドをすべて拒否するので影響しませんが、普段の agy の利用では影響します）。
 - **`session_id` の検証**：
   - セッションフォルダ外へのアクセスを防ぐため、本サーバーは `session_id` として UUID 形式のみを受け付けます。
 

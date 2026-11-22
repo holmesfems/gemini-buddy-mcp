@@ -10,6 +10,17 @@ import shutil
 API_KEY_VARS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 
+# Passed to every `agy -p` with --settings (this run only, merged over the user's settings.json;
+# deny wins over the user's allow). Headless agy still runs commands the user's settings allow,
+# even outside its sandbox when the sandbox fails to start (seen with agy 1.5.14), so deny them
+# all here, and file writes too (agy's image generator saves its image without write_file).
+STRICT_SETTINGS = {"permissions": {"allow": [], "deny": ["command(*)", "write_file(*)"], "ask": []}}
+
+
+def strict_settings_arg() -> list[str]:
+    return ["--settings", json.dumps(STRICT_SETTINGS, separators=(",", ":"))]
+
+
 def agy_exe() -> str:
     return os.environ.get("GEMINI_BUDDY_AGY") or shutil.which("agy") or "agy"
 

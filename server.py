@@ -35,9 +35,10 @@ from typing import Any, Literal
 import anyio
 from pydantic import BaseModel, Field
 
-from gemini_buddy import measure, media
+from gemini_buddy import acp, measure, media
 from gemini_buddy import review as review_mod
-from gemini_buddy.agyproc import API_KEY_VARS, agy_env, agy_exe, decode, parse_json_tail  # noqa: F401
+from gemini_buddy.agyproc import (API_KEY_VARS, agy_env, agy_exe, decode, parse_json_tail,  # noqa: F401
+                                  strict_settings_arg)
 from gemini_buddy.errors import Fail
 
 try:  # mcp 2.x renamed FastMCP to MCPServer
@@ -330,7 +331,7 @@ def record(session_id: str | None, kind: str, path: str, note: str) -> None:
 def agy_command(prompt: str, model: str, dirs: list[Path], mode: str = "plan") -> list[str]:
     # Never --dangerously-skip-permissions: headless agy may only read (or use its own generators).
     cmd = [AGY, "-p", prompt, "--model", model, "--mode", mode,
-           "--output-format", "json", "--print-timeout", f"{AGY_TIMEOUT}s"]
+           "--output-format", "json", "--print-timeout", f"{AGY_TIMEOUT}s", *strict_settings_arg()]
     for d in dict.fromkeys(str(p) for p in dirs):
         cmd += ["--add-dir", d]
     return cmd
@@ -345,13 +346,55 @@ def agy_workspace() -> Path:
     return p
 
 
+def agy_backend() -> str:
+    """"acp" (default): one long-running `agy acp`; "cli": a fresh `agy -p` per call."""
+    b = acp.env_backend()
+    if b not in ("acp", "cli"):
+        raise Fail(f"GEMINI_BUDDY_AGY_BACKEND must be acp or cli, got {b!r}")
+    return b
+
+
+def acp_client() -> acp.AcpClient:
+    return acp.shared(lambda: acp.AcpClient(agy_exe(), agy_workspace(), agy_env(),
+                                            acp.default_log_path(home())))
+
+
 def run_agy(prompt: str, model: str, dirs: list[Path], mode: str = "plan",
             guard: str = GUARD, need_text: bool = True) -> dict:
+    """Run one agy prompt. mode "plan" = read-only (consult / media analysis).
+
+    Other modes (accept-edits, for agy's image generator) always use `agy -p`: over ACP agy hands
+    images to a subagent that reports back after the turn ends, and outside plan mode ACP agy
+    runs commands its settings allow (e.g. proceed-in-sandbox) without asking us."""
+    if agy_backend() == "cli" or mode != "plan":
+        return run_agy_cli(prompt, model, dirs, mode, guard, need_text)
+    res = acp_client().prompt(guard + prompt, model, agy_workspace(), dirs, AGY_TIMEOUT)
+    if need_text and not res["response"]:
+        denied = res["denied_actions"]
+        hint = " agy tried something only a person may approve (often a shell command or an edit): " \
+               "do that step yourself (e.g. media_clip / media_frames) and ask agy only to look." if denied else ""
+        raise Fail(f"agy returned no answer (stop {res['stop_reason']}, denied {denied}).{hint}")
+    return res
+
+
+def run_agy_cli(prompt: str, model: str, dirs: list[Path], mode: str = "plan",
+                guard: str = GUARD, need_text: bool = True) -> dict:
+    if mode != "plan":
+        # A mode that may write runs in a throwaway folder, so nothing it leaves there (say a
+        # rules file) is seen by later sessions in the shared agy-cwd.
+        home().mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="agy-once-", dir=home()) as d:
+            return _run_agy_cli(prompt, model, dirs, mode, guard, need_text, Path(d))
+    return _run_agy_cli(prompt, model, dirs, mode, guard, need_text, agy_workspace())
+
+
+def _run_agy_cli(prompt: str, model: str, dirs: list[Path], mode: str, guard: str, need_text: bool,
+                 cwd: Path) -> dict:
     t0 = time.time()
     try:
         r = subprocess.run(agy_command(guard + prompt, model, dirs, mode), capture_output=True,
                            env=agy_env(), stdin=subprocess.DEVNULL, timeout=AGY_TIMEOUT + 60,
-                           cwd=str(agy_workspace()))
+                           cwd=str(cwd))
     except FileNotFoundError:
         raise Fail(f"agy not found ({AGY}); install Antigravity CLI or set GEMINI_BUDDY_AGY")
     except subprocess.TimeoutExpired:
@@ -720,8 +763,10 @@ async def gemini_review(repo: str, base: str | None = None, commit: str | None =
     branch, commit="<sha>" for one commit, staged=True for staged changes.
     intent: what the change is meant to do, in the author's words (default: commit messages).
       Do not put your own review opinions here; the point is an independent second look.
-    models: agy models run in parallel (default gemini-4-neon-high; add gemini-4-hydrogen-high
-      for a fast second vote). Findings on the same place are merged; `agreed` = how many models.
+    models: agy models (default gemini-4-neon-high alone; another Gemini adds little next to
+      Claude). With several, findings on the same place are merged; `agreed` = how many models.
+    Findings come back as a list; `unparsed` holds any answer whose findings could not be read
+    as JSON: read it yourself.
     Secret-looking lines stop the run with status STOPPED and nothing is sent; show those lines to
     the user and pass allow_secret_like=True only if they say it is fine.
     Takes minutes. Findings are candidates: trace each one in the code before reporting it.
@@ -730,9 +775,10 @@ async def gemini_review(repo: str, base: str | None = None, commit: str | None =
         "staged changes" if staged else "uncommitted changes"
     s = open_session(session_id, f"review {target} in {repo}")  # before minutes of work
     work = work_dir("review", out_dir, session_id)
+    client = acp_client if agy_backend() == "acp" else None
     result = await anyio.to_thread.run_sync(lambda: review_mod.review(
         repo, base=base, commit=commit, staged=staged, intent=intent, models=models, out=work,
-        allow_secret_like=allow_secret_like))
+        allow_secret_like=allow_secret_like, client=client() if client else None))
     if result.get("status") == "STOPPED":
         return result
     lines = [f"- [{g['severity']}] {g['file']}:{g['line']} (agreed {g['agreed']}): "

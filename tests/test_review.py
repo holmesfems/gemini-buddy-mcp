@@ -177,13 +177,14 @@ class Review(BuildDiff):
         (self.repo / "a.txt").write_text("a\nchanged\n")
         answers = {"m1": [{"file": "a.txt", "line": 2, "severity": "high", "confidence": 0.9}],
                    "m2": [{"file": "a.txt", "line": 3, "severity": "low", "confidence": 0.5}]}
-        envs = []
+        envs, cmds = [], []
         real_run = subprocess.run
 
         def fake_run(cmd, **kw):
             if cmd[0] == "git":
                 return real_run(cmd, **kw)
             envs.append(kw["env"])
+            cmds.append(cmd)
             model = cmd[cmd.index("--model") + 1]
             out = {"status": "SUCCESS", "structured_output": {"findings": answers[model]}}
             return subprocess.CompletedProcess(cmd, 0, json.dumps(out).encode(), b"")
@@ -197,6 +198,9 @@ class Review(BuildDiff):
         self.assertEqual(r["findings"][0]["agreed"], 2)
         self.assertEqual(r["findings"][0]["severity"], "high")
         self.assertTrue(all("GEMINI_API_KEY" not in e for e in envs))
+        for cmd in cmds:  # commands and writes denied over the user's allow list
+            deny = json.loads(cmd[cmd.index("--settings") + 1])["permissions"]["deny"]
+            self.assertIn("command(*)", deny)
         self.assertIn("change a", (Path(self.tmp.name) / "w2" / "ask.txt").read_text(encoding="utf-8"))
 
 
