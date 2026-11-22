@@ -25,7 +25,9 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        patcher = mock.patch.dict(os.environ, {"GEMINI_BUDDY_HOME": str(self.root / "home"),
+        # these tests fake `agy -p` (subprocess.run); the ACP backend is in test_acp.py
+        patcher = mock.patch.dict(os.environ, {"GEMINI_BUDDY_AGY_BACKEND": "cli",
+                                               "GEMINI_BUDDY_HOME": str(self.root / "home"),
                                                "GEMINI_API_KEY": "test-key", "GOOGLE_API_KEY": "x"})
         patcher.start()
         self.addCleanup(patcher.stop)

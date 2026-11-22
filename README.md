@@ -7,6 +7,8 @@
 Claude Code などの MCP クライアントから Gemini を「相棒」として呼ぶための、stdio 型の MCP サーバーです。[agy-media](https://github.com/holmesfems/agy-media)（スキル版）の中身をすべて MCP のツールに移しました。
 
 - **相談・メディア解析・コードレビュー**：本サーバーが、サブスクでログイン済みの [Antigravity CLI](https://antigravity.google/)（`agy`）をサブプロセスで実行します。子プロセスの環境変数から `GEMINI_API_KEY`・`GOOGLE_API_KEY` を削除するため、**API キーによる課金は発生しません**。
+  - 相談とメディア解析は、`agy acp`（[Agent Client Protocol](https://agentclientprotocol.com/) のサーバー）を 1 つ起動したままにして、呼ぶたびに新しいセッションを開きます。`agy -p` を毎回起動するより 1 回あたり 2 秒ほど速く、サインインは `agy` のログイン（`oauth-personal`）をそのまま使います。
+  - コードレビューと `backend="agy"` の画像生成は、これまでどおり `agy -p` で実行します（理由は「安全のために」）。
 - **画像・音声の生成**：既定では `GEMINI_API_KEY` を使って `google-genai` SDK（API のクレジット枠）で実行します。画像生成のみ、`backend="agy"` を指定することで `agy` 組み込みの画像生成（サブスク枠）も使用できます。
 - **機械的な下ごしらえと計測（ローカル実行）**：AI モデルを使わずローカルで処理します（ffmpeg での切り出し・コマ画像化・座標の目盛り、無音区間・ラウドネス・スペクトログラム、声と BGM の音量差、OpenCV での追跡、座標の描き込み確認）。
 - **セッション管理**：どのツールも `session_id` を受け取れます。会話・解析したメディアの要約・生成したファイルの記録は `~/.gemini-buddy-mcp/sessions/<session_id>.json` に保存され、同じ `session_id` を渡すことで続きから依頼できます。
@@ -75,6 +77,7 @@ MCP クライアント（Claude など）および人間は、`agy`（Gemini）�
 
 - Python 3.10+
 - `agy`（インストールおよびログイン済みであること。`agy models` を実行してモデル一覧が表示されること）
+  - ACP でサインインできないと言われたら、ターミナルで一度 `agy acp --login` を実行してください（Google のサインインが開きます）。`agy acp` の標準エラーは `~/.gemini-buddy-mcp/agy-acp.log` に出ます。
 - `GEMINI_API_KEY`（API 枠で画像生成・TTS を使う場合のみ必要）
 - Pillow・numpy・OpenCV・ffmpeg（ローカルのツールに必要。`[media]` オプションでインストールされる。PATH 上に `ffmpeg` がない場合は、自動で `imageio-ffmpeg` 同梱のものを使用する）
 - git（`gemini_review` に必要）
@@ -145,6 +148,7 @@ API 枠の画像生成・TTS 以外のツールは、`agy` のログインとロ
 | `GEMINI_BUDDY_TTS_MODEL` | `gemini-3.8-flash-tts` | API の読み上げモデル |
 | `GEMINI_BUDDY_AGY_TIMEOUT` | `600` | `agy` を待つ秒数（`gemini_review` は 1 モデルあたり 900 秒） |
 | `GEMINI_BUDDY_AGY` | PATH の `agy` | `agy` の実行ファイル |
+| `GEMINI_BUDDY_AGY_BACKEND` | `acp` | 相談・メディア解析の呼び方。`acp` = 起動したままの `agy acp`、`cli` = 毎回 `agy -p`（ACP で困ったときの戻し先） |
 | `GEMINI_BUDDY_HOME` | `~/.gemini-buddy-mcp` | セッションと作業フォルダを置く場所 |
 | `AGY_BRAIN_DIR` | `~/.gemini/antigravity-cli/brain` | `agy` が画像を保存するフォルダ（`backend="agy"` で取り出す） |
 
@@ -171,8 +175,11 @@ API の画像生成または TTS がモデル ID の不一致で失敗した場�
 ## 安全のために
 
 - **`agy` の実行モードとアクセス範囲**：
-  - **通常時（相談・メディア解析・コードレビュー）**：本サーバーは `agy` を `--mode plan`（読み取り専用）で起動し、`--dangerously-skip-permissions` は付与しません。`agy` が読めるのは、渡したファイルのあるフォルダ（`--add-dir`）のみです。
-  - **例外（`backend="agy"` の画像生成）**：`agy` が自身の出力フォルダに画像を書き込めるよう `accept-edits` で起動し、ほかのファイルに触れないようプロンプトで指示します。
+  - **通常時（相談・メディア解析・コードレビュー）**：本サーバーは `agy` を plan モード（読み取り専用）で動かし、`--dangerously-skip-permissions` は付与しません。`agy` が読めるのは、空の作業フォルダと、渡したファイルのあるフォルダ（`--add-dir`、ACP では `additionalDirectories`）のみです。
+  - **ACP（相談・メディア解析）**：セッションは必ず plan モードで開き、`agy` から届く許可の求め（`session/request_permission`）はすべて断って `denied_actions` に記録します。ファイルの読み書き・端末の機能はクライアントとして提供しません。
+    - **plan モードに限る理由**：ACP の `default`・`accept-edits` モードでは、`agy` は自分の `settings.json` で許されたコマンド（`"toolPermission": "proceed-in-sandbox"` ならサンドボックス内のコマンド全般）を、許可を求めずに実行します（2026-11 の実測で `echo` が聞かれずに動いた）。plan モードではコマンドを実行せず、計画を書くだけでした。
+  - **例外（`backend="agy"` の画像生成）**：`agy -p` を `accept-edits` で起動し、ほかのファイルに触れないようプロンプトで指示します。ACP では画像生成がサブエージェントに回され、ターンが終わってから結果が返る作りのため使いません。
+  - **コードレビュー**：`--json-schema` で答えの形を決められるのが `agy -p` だけなので、`agy -p` のままです。
 - **ヘッドレス `agy` のコマンド実行制限**：
   - ヘッドレス実行の `agy` はシェルコマンドを実行できません。MCP クライアント（またはユーザー）は、動画の切り出し等の前処理を事前に `media_*` ツールで済ませてから `agy` に渡してください。
   - 返り値に `denied_actions` が含まれている場合、`agy` が何らかのコマンドや操作を実行しようとして拒否された印です。

@@ -35,7 +35,7 @@ from typing import Any, Literal
 import anyio
 from pydantic import BaseModel, Field
 
-from gemini_buddy import measure, media
+from gemini_buddy import acp, measure, media
 from gemini_buddy import review as review_mod
 from gemini_buddy.agyproc import API_KEY_VARS, agy_env, agy_exe, decode, parse_json_tail  # noqa: F401
 from gemini_buddy.errors import Fail
@@ -345,8 +345,39 @@ def agy_workspace() -> Path:
     return p
 
 
+def agy_backend() -> str:
+    """"acp" (default): one long-running `agy acp`; "cli": a fresh `agy -p` per call."""
+    b = acp.env_backend()
+    if b not in ("acp", "cli"):
+        raise Fail(f"GEMINI_BUDDY_AGY_BACKEND must be acp or cli, got {b!r}")
+    return b
+
+
+def acp_client() -> acp.AcpClient:
+    return acp.shared(lambda: acp.AcpClient(agy_exe(), agy_workspace(), agy_env(),
+                                            acp.default_log_path(home())))
+
+
 def run_agy(prompt: str, model: str, dirs: list[Path], mode: str = "plan",
             guard: str = GUARD, need_text: bool = True) -> dict:
+    """Run one agy prompt. mode "plan" = read-only (consult / media analysis).
+
+    Other modes (accept-edits, for agy's image generator) always use `agy -p`: over ACP agy hands
+    images to a subagent that reports back after the turn ends, and outside plan mode ACP agy
+    runs commands its settings allow (e.g. proceed-in-sandbox) without asking us."""
+    if agy_backend() == "cli" or mode != "plan":
+        return run_agy_cli(prompt, model, dirs, mode, guard, need_text)
+    res = acp_client().prompt(guard + prompt, model, agy_workspace(), dirs, AGY_TIMEOUT)
+    if need_text and not res["response"]:
+        denied = res["denied_actions"]
+        hint = " agy tried something only a person may approve (often a shell command or an edit): " \
+               "do that step yourself (e.g. media_clip / media_frames) and ask agy only to look." if denied else ""
+        raise Fail(f"agy returned no answer (stop {res['stop_reason']}, denied {denied}).{hint}")
+    return res
+
+
+def run_agy_cli(prompt: str, model: str, dirs: list[Path], mode: str = "plan",
+                guard: str = GUARD, need_text: bool = True) -> dict:
     t0 = time.time()
     try:
         r = subprocess.run(agy_command(guard + prompt, model, dirs, mode), capture_output=True,
