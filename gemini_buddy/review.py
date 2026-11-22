@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
-from .agyproc import agy_env, agy_exe, decode, parse_json_tail
+from .agyproc import agy_env, agy_exe, decode, parse_json_tail, strict_settings_arg
 from .errors import Fail
 
 # Neon found the most (incl. a real race the others missed) in agy-media's comparison.
@@ -225,7 +225,7 @@ def run_model(model: str, prompt: str, repo: Path, work: Path, schema_path: Path
         return run_model_acp(client, model, prompt, repo, work, timeout)
     cmd = [agy, "-p", prompt, "--model", model, "--mode", "plan", "--output-format", "json",
            "--json-schema", str(schema_path), "--print-timeout", f"{timeout}s",
-           "--add-dir", str(repo), "--add-dir", str(work)]
+           "--add-dir", str(repo), "--add-dir", str(work), *strict_settings_arg()]
     t0 = time.time()
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=timeout + 60, cwd=str(repo),

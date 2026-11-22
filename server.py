@@ -37,7 +37,8 @@ from pydantic import BaseModel, Field
 
 from gemini_buddy import acp, measure, media
 from gemini_buddy import review as review_mod
-from gemini_buddy.agyproc import API_KEY_VARS, agy_env, agy_exe, decode, parse_json_tail  # noqa: F401
+from gemini_buddy.agyproc import (API_KEY_VARS, agy_env, agy_exe, decode, parse_json_tail,  # noqa: F401
+                                  strict_settings_arg)
 from gemini_buddy.errors import Fail
 
 try:  # mcp 2.x renamed FastMCP to MCPServer
@@ -330,7 +331,7 @@ def record(session_id: str | None, kind: str, path: str, note: str) -> None:
 def agy_command(prompt: str, model: str, dirs: list[Path], mode: str = "plan") -> list[str]:
     # Never --dangerously-skip-permissions: headless agy may only read (or use its own generators).
     cmd = [AGY, "-p", prompt, "--model", model, "--mode", mode,
-           "--output-format", "json", "--print-timeout", f"{AGY_TIMEOUT}s"]
+           "--output-format", "json", "--print-timeout", f"{AGY_TIMEOUT}s", *strict_settings_arg()]
     for d in dict.fromkeys(str(p) for p in dirs):
         cmd += ["--add-dir", d]
     return cmd
@@ -378,11 +379,22 @@ def run_agy(prompt: str, model: str, dirs: list[Path], mode: str = "plan",
 
 def run_agy_cli(prompt: str, model: str, dirs: list[Path], mode: str = "plan",
                 guard: str = GUARD, need_text: bool = True) -> dict:
+    if mode != "plan":
+        # A mode that may write runs in a throwaway folder, so nothing it leaves there (say a
+        # rules file) is seen by later sessions in the shared agy-cwd.
+        home().mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="agy-once-", dir=home()) as d:
+            return _run_agy_cli(prompt, model, dirs, mode, guard, need_text, Path(d))
+    return _run_agy_cli(prompt, model, dirs, mode, guard, need_text, agy_workspace())
+
+
+def _run_agy_cli(prompt: str, model: str, dirs: list[Path], mode: str, guard: str, need_text: bool,
+                 cwd: Path) -> dict:
     t0 = time.time()
     try:
         r = subprocess.run(agy_command(guard + prompt, model, dirs, mode), capture_output=True,
                            env=agy_env(), stdin=subprocess.DEVNULL, timeout=AGY_TIMEOUT + 60,
-                           cwd=str(agy_workspace()))
+                           cwd=str(cwd))
     except FileNotFoundError:
         raise Fail(f"agy not found ({AGY}); install Antigravity CLI or set GEMINI_BUDDY_AGY")
     except subprocess.TimeoutExpired:

@@ -139,6 +139,21 @@ class AgyTests(Base):
         self.assertEqual(cmd.count("--add-dir"), 2)
         self.assertIn("json", cmd)
 
+    def test_command_denies_all_commands_and_writes(self):
+        cmd = server.agy_command("p", "m", [])
+        settings = json.loads(cmd[cmd.index("--settings") + 1])
+        self.assertEqual(settings["permissions"]["allow"], [])
+        self.assertIn("command(*)", settings["permissions"]["deny"])
+        self.assertIn("write_file(*)", settings["permissions"]["deny"])
+
+    def test_writing_mode_runs_in_a_throwaway_folder(self):
+        with mock.patch("subprocess.run", return_value=fake_agy("ok")) as run:
+            server.run_agy("p", "m", [], mode="accept-edits", need_text=False)
+        cwd = Path(run.call_args.kwargs["cwd"])
+        self.assertNotEqual(cwd, self.root / "home" / "agy-cwd")
+        self.assertTrue(cwd.name.startswith("agy-once-"))
+        self.assertFalse(cwd.exists())          # removed afterwards
+
     def test_agy_runs_in_an_empty_folder_not_the_servers(self):
         with mock.patch("subprocess.run", return_value=fake_agy("ok")) as run:
             server.run_agy("p", "m", [])
