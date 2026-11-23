@@ -5,6 +5,8 @@ Two backends, chosen per tool:
 - Consult / media analysis / code review -> the `agy` CLI (Antigravity, signed in
   with the subscription). `GEMINI_API_KEY` / `GOOGLE_API_KEY` are removed from the
   child's environment so these calls never fall through to API billing.
+- Delegated coding tasks (gemini_delegate_*) -> one `agy acp` per task in its own git
+  worktree, with agy's own settings swapped for strict ones (see gemini_buddy/delegate.py).
 - Image / audio generation -> the `google-genai` SDK with `GEMINI_API_KEY`
   (the monthly API credit). Images can also be made through agy (backend="agy").
 
@@ -35,7 +37,7 @@ from typing import Any, Literal
 import anyio
 from pydantic import BaseModel, Field
 
-from gemini_buddy import acp, measure, media
+from gemini_buddy import acp, delegate, measure, media
 from gemini_buddy import review as review_mod
 from gemini_buddy.agyproc import (API_KEY_VARS, agy_env, agy_exe, decode, parse_json_tail,  # noqa: F401
                                   strict_settings_arg)
@@ -90,6 +92,11 @@ Gemini を相棒にするツール群。Claude にできない・苦手なこと
   - gemini_review の指摘は 1 件ずつ実際のコードでたどってから報告する。agreed が多くても確かめずに本物扱いしない。
 - モデル: 音声・動画は gemini-4-hydrogen-high（速い）、座標・コードレビューは gemini-4-neon-high（正確）。
 - gemini_review の intent には作者の意図だけを書く（Claude の意見を混ぜない）。STOPPED が返ったらその行をユーザーに見せる。
+- gemini_delegate_start は作業を丸ごと任せる（新しい git worktree で、agy は worktree の中だけ読み書きできる）。
+  start のあとは gemini_delegate_status（wait_seconds で待てる）。マージはしない: 終わったら changes の差分を
+  自分で読んで確かめてから取り込む（agy の「テストした」「直した」は主張として扱う）。直してほしい点は
+  gemini_delegate_reply、要らなくなった worktree は gemini_delegate_cancel(discard=True)。
+  status が stopped なら warnings をユーザーに見せる（agy が許可なしに動こうとした印）。
 
 頼み方の例（gemini_analyze_media の prompt）:
 - 文字起こし（media_audio の audio.wav、30〜60 秒ずつ）: "Listen once. Answer a transcript, one utterance per
@@ -794,6 +801,81 @@ async def gemini_review(repo: str, base: str | None = None, commit: str | None =
 
     update_session(s, change)
     return {"session_id": s.session_id, **result}
+
+
+DELEGATE_MODEL = os.environ.get("GEMINI_BUDDY_DELEGATE_MODEL", "gemini-4-neon-high")
+
+
+@mcp.tool()
+async def gemini_delegate_start(task: str, repo: str, base: str | None = None, model: str | None = None,
+                                allow_commands: list[str] | None = None,
+                                session_id: str | None = None) -> dict:
+    """Hand a coding task to Gemini (agy, subscription), which works on it alone in a new git worktree.
+
+    Returns at once with a task_id; follow it with gemini_delegate_status. Nothing is merged: when
+    agy is done, its changes are staged in the worktree and written to changes.patch. Read the
+    diff yourself, then take in what is good (e.g. `git apply <patch_file>` in your checkout).
+    repo: a folder in the git repository. base: commit / branch to start from (default HEAD;
+      uncommitted changes in your checkout are NOT in the worktree, so commit them first if needed).
+    task: what to do, self-contained (agy sees only the worktree and this text).
+    allow_commands: commands agy may run, matched as a prefix (e.g. ["python -m unittest"]);
+      none by default. Shell operators are refused. An allowed command can run code agy wrote.
+    agy may read and edit only inside the worktree. Anything else is refused, and a refusal ends
+    its turn (it is nudged to go on, at most twice). Subagents, or anything run without asking,
+    stop the task. Before each task a short check confirms agy asks before acting (~10 s).
+    model: agy model (default gemini-4-neon-high).
+    """
+    if session_id:
+        require_session(session_id)
+    use = model or DELEGATE_MODEL
+    t = await anyio.to_thread.run_sync(lambda: delegate.start(
+        home(), repo, task, use, base=base, allow_commands=allow_commands, session_id=session_id))
+    if session_id:
+        art = Artifact(kind="delegate", path=str(t.folder), prompt=task, model=use, at=now())
+        turn = Turn(tool="gemini_delegate_start", at=now(), prompt=task,
+                    response=f"task {t.id} in worktree {t.worktree}", model=use)
+
+        def change(x: Session) -> None:
+            x.turns.append(turn)
+            x.artifacts.append(art)
+
+        update_session(open_session(session_id, task), change)
+    return {"task_id": t.id, "status": t.status, "worktree": str(t.worktree), "branch": t.branch,
+            "base_sha": t.base_sha, "model": use, "allow_commands": t.commands}
+
+
+@mcp.tool()
+async def gemini_delegate_status(task_id: str, wait_seconds: float = 0, since: int = 0) -> dict:
+    """Progress of a delegated task: tool calls (with what was allowed / denied) and agy's messages.
+
+    status: starting / checking (isolation check) / running / done / failed / stopped (agy did
+    something not allowed; see warnings) / cancelled / interrupted (the server restarted).
+    When not running: response (agy's summary) and changes (files, stat, patch_file, patch).
+    wait_seconds: wait up to this long (max 110) for the task to finish before answering.
+    since: pass next_since from the last answer to get only events that are new or changed since
+      (a tool call's status and permission are updated in place).
+    Check the diff in the code yourself; agy's summary is a claim, not a test result.
+    """
+    return await anyio.to_thread.run_sync(lambda: delegate.status(home(), task_id, since, wait_seconds))
+
+
+@mcp.tool()
+async def gemini_delegate_reply(task_id: str, message: str) -> dict:
+    """Send a follow-up to a finished task in the same agy session (e.g. review comments to fix).
+
+    Works while agy is still up (GEMINI_BUDDY_DELEGATE_IDLE seconds after the last turn, default
+    1800). Then follow it with gemini_delegate_status as after start.
+    """
+    return await anyio.to_thread.run_sync(lambda: delegate.reply(home(), task_id, message))
+
+
+@mcp.tool()
+async def gemini_delegate_cancel(task_id: str, discard: bool = False) -> dict:
+    """Stop a delegated task (kills its agy, subagents included). The worktree is kept to inspect.
+
+    discard: also remove the worktree and its branch (also for finished tasks, to clean up).
+    """
+    return await anyio.to_thread.run_sync(lambda: delegate.cancel(home(), task_id, discard))
 
 
 @mcp.tool()

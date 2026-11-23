@@ -200,6 +200,15 @@ class AcpClient:
     def notify(self, method: str, params: dict) -> None:
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
 
+    def attach(self, session_id: str, turn: Any) -> None:
+        """Route a session's updates and permission requests to `turn` (on_update / on_permission)."""
+        with self._lock:
+            self._turns[session_id] = turn
+
+    def detach(self, session_id: str) -> None:
+        with self._lock:
+            self._turns.pop(session_id, None)
+
     def _read_loop(self) -> None:
         try:
             for line in self.proc.stdout:
@@ -265,8 +274,7 @@ class AcpClient:
         except (RpcError, TimeoutError, TypeError, KeyError) as e:
             raise Fail(f"agy acp could not open a session: {e}")
         turn = _Turn()
-        with self._lock:
-            self._turns[sid] = turn
+        self.attach(sid, turn)
         try:
             self.request("session/set_mode", {"sessionId": sid, "modeId": "plan"})
             self.request("session/set_model", {"sessionId": sid, "modelId": model})
@@ -279,8 +287,7 @@ class AcpClient:
         except (RpcError, TimeoutError) as e:   # set_mode failing means we never prompt outside plan
             raise Fail(f"agy acp failed: {e}")
         finally:
-            with self._lock:
-                self._turns.pop(sid, None)
+            self.detach(sid)
             try:
                 self.request("session/close", {"sessionId": sid}, 10)
             except Exception:  # noqa: BLE001 - closing is best effort
