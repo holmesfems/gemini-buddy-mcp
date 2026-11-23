@@ -152,14 +152,30 @@ class DelegateRuns(DelegateBase):
         self.assertIn("return a - b", (self.repo / "a.py").read_text())        # nothing merged
         self.assertTrue(any(e.get("permission") == "allowed" for e in r["events"]))
         self.assertEqual({m["params"]["modeId"] for m in self.sent("session/set_mode")}, {"default"})
-        self.assertEqual(self.sent("session/new")[0]["params"]["cwd"],
-                         str(self.root / "home" / "delegate" / "_check"))      # the check runs first
+        self.assertEqual(self.sent("session/new")[0]["params"]["cwd"],     # the check runs first, in a
+                         str((self.root / "home" / "delegate" / "_check").resolve()))   # long-named path
         self.assertEqual(Path(self.sent("session/new")[1]["params"]["cwd"]), Path(started["worktree"]))
         settings = self.root / "agyapp" / "gemini-buddy-delegate" / "settings.json"
         self.assertEqual(json.loads(settings.read_text())["toolPermission"], "strict")
         self.assertIn(started["branch"], self.git(self.repo, "branch"))
         saved = server.open_session(s, "")
         self.assertEqual(saved.artifacts[-1].kind, "delegate")
+
+    @unittest.skipUnless(os.name == "nt", "8.3 short names are a Windows thing")
+    def test_short_named_home_reaches_agy_long_named(self):
+        import ctypes
+        home = self.root / "long-named-home"
+        home.mkdir()
+        buf = ctypes.create_unicode_buffer(1024)
+        ctypes.windll.kernel32.GetShortPathNameW(str(home), buf, len(buf))
+        if not buf.value or Path(buf.value).name == home.name:
+            self.skipTest("this volume makes no 8.3 short names")
+        with mock.patch.dict(os.environ, {"GEMINI_BUDDY_HOME": buf.value}):
+            r = self.wait(self.start("EDIT_INSIDE fix add")["task_id"])
+        self.assertEqual(r["status"], "done", r)
+        cwds = [m["params"]["cwd"] for m in self.sent("session/new")]
+        self.assertEqual(cwds[0], str((home / "delegate" / "_check").resolve()))
+        self.assertFalse(any("~" in c for c in cwds), cwds)
 
     def test_outside_write_is_denied_then_nudged(self):
         r = self.wait(self.start("EDIT_OUTSIDE EDIT_INSIDE")["task_id"])
