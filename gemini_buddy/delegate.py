@@ -57,6 +57,7 @@ FILE_KINDS = {"read", "edit", "delete", "move"}
 SECRET_NAMES = (".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*",
                 "*credentials*.json", "secrets.*", "*.secret")
 SHELL_META = re.compile(r"[;&|<>`$%^\r\n(){}]")
+CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f\x85  ]")   # tab is fine
 PATH_KEY = re.compile(r"path|file|dir|cwd", re.I)
 
 RUNNING = ("starting", "checking", "running")
@@ -95,7 +96,15 @@ def write_settings() -> Path:
     folder = agy_app_dir() / CLI_DIR_NAME
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / "settings.json"
-    path.write_text(json.dumps(SETTINGS, indent=2), encoding="utf-8")
+    text = json.dumps(SETTINGS, indent=2)
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return path      # unchanged: do not rewrite under an agy that is reading it
+    except (OSError, UnicodeDecodeError):
+        pass
+    tmp = folder / f"settings.{uuid.uuid4().hex[:8]}.tmp"   # a task starting at the same time
+    tmp.write_text(text, encoding="utf-8")                  # never sees a half-written file
+    os.replace(tmp, path)
     return path
 
 
@@ -109,20 +118,27 @@ def default_client(cwd: Path, log: Path | None) -> AcpClient:
 
 # ---------------------------------------------------------------- policy
 
+def plain_command(cmd: str) -> str | None:
+    """`cmd` with runs of spaces collapsed, or None if it has shell operators or control characters.
+    Checked on the raw text: collapsing first would turn a newline (a second command) into a space."""
+    cmd = cmd or ""
+    if SHELL_META.search(cmd) or CONTROL.search(cmd):
+        return None
+    return " ".join(cmd.split()) or None
+
+
 def command_allowed(cmd: str, allowed: list[str]) -> bool:
-    cmd = " ".join((cmd or "").split())
-    if not cmd or SHELL_META.search(cmd):
-        return False
-    return any(cmd == a or cmd.startswith(a + " ") for a in allowed)
+    cmd = plain_command(cmd)
+    return cmd is not None and any(cmd == a or cmd.startswith(a + " ") for a in allowed)
 
 
 def check_commands(allowed: list[str] | None) -> list[str]:
     out = []
     for a in allowed or []:
-        a = " ".join((a or "").split())
-        if not a or SHELL_META.search(a):
+        plain = plain_command(a)
+        if plain is None:
             raise Fail(f"allow_commands entries must be plain commands without shell operators, got {a!r}")
-        out.append(a)
+        out.append(plain)
     return out
 
 
@@ -316,6 +332,7 @@ class Task:
         self.status = "starting"
         self.error: str | None = None
         self.events: list[dict] = []
+        self.rev = 0                      # bumped on every event change; status(since=) uses it
         self._tool_at: dict[str, int] = {}
         self.approved: set = set()
         self.denied: list[dict] = []
@@ -339,8 +356,14 @@ class Task:
     # ------------------------------------------------ events from agy (reader thread)
 
     def _event(self, ev: dict) -> None:
-        ev["t"] = round(time.time() - self.started, 1)
+        ev["i"], ev["t"] = len(self.events), round(time.time() - self.started, 1)
         self.events.append(ev)
+        self._touch(ev)
+
+    def _touch(self, ev: dict) -> None:
+        """An event changed (a tool call's status or permission is updated in place)."""
+        self.rev += 1
+        ev["rev"] = self.rev
 
     def on_update(self, u: dict) -> None:
         kind = u.get("sessionUpdate")
@@ -364,6 +387,7 @@ class Task:
             for k_src, k_dst in (("name", "tool"), ("kind", "kind"), ("title", "title"), ("status", "status")):
                 if u.get(k_src) is not None:
                     ev[k_dst] = u[k_src] if k_src != "title" else str(u[k_src])[:300]
+            self._touch(ev)
             name = ev.get("tool") or ""
             if "subagent" in name.lower():
                 violation = f"agy started a subagent ({ev.get('title')}); subagents run without asking"
@@ -381,7 +405,9 @@ class Task:
             if allow and cid:
                 self.approved.add(cid)
             if cid in self._tool_at:
-                self.events[self._tool_at[cid]]["permission"] = "allowed" if allow else f"denied: {why}"
+                ev = self.events[self._tool_at[cid]]
+                ev["permission"] = "allowed" if allow else f"denied: {why}"
+                self._touch(ev)
             else:
                 self._event({"type": "permission", "tool": call.get("name"), "kind": call.get("kind"),
                              "title": str(call.get("title"))[:300],
@@ -393,6 +419,11 @@ class Task:
         return pick(params.get("options") or [], allow)
 
     # ------------------------------------------------ running
+
+    def busy(self) -> bool:
+        """Running, or ended but finish() has not yet collected the changes and saved."""
+        with self.lock:
+            return self.status in RUNNING or self.finished is None
 
     def stop(self, why: str, status: str = "stopped") -> None:
         """End the task now: kill agy (subagents included)."""
@@ -461,15 +492,18 @@ class Task:
             write_settings()
             client = make_client(self.worktree, self.folder / "agy-acp.log")
             with self.lock:
-                if self.status not in RUNNING:
-                    return
-                self.client = client
+                ended = self.status not in RUNNING
+                if not ended:
+                    self.client = client
+            if ended:      # cancelled meanwhile: still finish, so cancel() and task.json see it
+                return self.finish(self.status)
             client.start()
             with self.lock:
-                if self.status not in RUNNING:
-                    client.close()
-                    return
-                self.status = "checking"
+                ended = self.status not in RUNNING
+                if not ended:
+                    self.status = "checking"
+            if ended:
+                return self.finish(self.status)
             isolation_check(client, check_dir, self.model)
             try:
                 sid = client.request("session/new", {"cwd": str(self.worktree), "mcpServers": []})["sessionId"]
@@ -482,9 +516,11 @@ class Task:
             except (RpcError, TimeoutError) as e:
                 raise Fail(f"agy acp failed to set up the session: {e}")
             with self.lock:
-                if self.status not in RUNNING:
-                    return
-                self.sid, self.status = sid, "running"
+                ended = self.status not in RUNNING
+                if not ended:
+                    self.sid, self.status = sid, "running"
+            if ended:
+                return self.finish(self.status)
             self._work(first_prompt(self))
             self.finish("done")
         except Fail as e:
@@ -494,7 +530,7 @@ class Task:
 
     def reply(self, message: str) -> None:
         with self.lock:
-            if self.status in RUNNING:
+            if self.busy():
                 raise Fail("the task is still running; wait for it (gemini_delegate_status)")
             if self.status != "done" or self.client is None or not self.client.alive() or self.discarded:
                 raise Fail(f"cannot continue this task (status {self.status}"
@@ -506,6 +542,7 @@ class Task:
             self.status, self.error, self.nudges, self.finished = "running", None, 0, None
             self.deadline = time.time() + timeout_seconds()
             self._event({"type": "note", "text": f"reply: {message[:300]}"})
+            self.save()    # a crash during this turn must read back as interrupted, not done
         threading.Thread(target=self._reply_run, args=(message,), daemon=True,
                          name=f"delegate-{self.id[:8]}").start()
 
@@ -525,7 +562,6 @@ class Task:
                 if error:
                     self.error = error
             final = self.status
-            self.finished = time.time()
         if final != "done":
             self._close_client()
         if not self.discarded:
@@ -540,6 +576,7 @@ class Task:
                 self._idle = threading.Timer(idle_seconds(), self._close_client)
                 self._idle.daemon = True
                 self._idle.start()
+            self.finished = time.time()   # only now: status() and cancel() wait for this
             self.save()
             self.changed.notify_all()
 
@@ -553,8 +590,10 @@ class Task:
                     "session_id": self.session_id, "created_at": self.created_at,
                     "seconds": round((self.finished or time.time()) - self.started, 1),
                     "turns": self.turns, "nudges": self.nudges, "stop_reason": self.stop_reason,
-                    "response": self.response, "events": self.events, "denied": self.denied,
-                    "warnings": self.warnings, "changes": self.changes, "discarded": self.discarded}
+                    "response": self.response, "events": [dict(e) for e in self.events], "rev": self.rev,
+                    "denied": [dict(d) for d in self.denied], "warnings": list(self.warnings),
+                    "changes": dict(self.changes) if self.changes else self.changes,
+                    "settled": self.finished is not None, "discarded": self.discarded}
 
     def save(self) -> None:
         path = self.folder / "task.json"
@@ -604,9 +643,12 @@ def nudge_text(denied: list[str]) -> str:
 def collect_changes(t: Task) -> dict:
     """Stage everything in the worktree and diff it against the base commit."""
     git(["add", "-A"], t.worktree)
-    names = git(["diff", "--cached", "--name-status", t.base_sha], t.worktree)
-    stat = git(["diff", "--cached", "--stat", t.base_sha], t.worktree)
-    patch = git(["diff", "--cached", "--binary", t.base_sha], t.worktree, raw=True)
+    # plain diffs whatever the user's git config says (color.ui=always, diff.external): the patch
+    # must apply with `git apply`
+    diff = ["diff", "--cached", "--no-color", "--no-ext-diff"]
+    names = git([*diff, "--name-status", t.base_sha], t.worktree)
+    stat = git([*diff, "--stat", t.base_sha], t.worktree)
+    patch = git([*diff, "--binary", t.base_sha], t.worktree, raw=True)
     path = t.folder / "changes.patch"
     path.write_bytes(patch)
     files = [{"status": line.split("\t", 1)[0], "path": line.split("\t")[-1]}
@@ -664,6 +706,7 @@ def _load(home: Path, task_id: str) -> Task | dict:
     if rec.get("status") in RUNNING:
         rec["status"] = "interrupted"
         rec["error"] = "the server stopped while this task ran (its agy was closed with it)"
+    rec["settled"] = True   # nothing will finish it any more
     return rec
 
 
@@ -672,7 +715,7 @@ def status(home: Path, task_id: str, since: int = 0, wait_seconds: float = 0.0) 
     if isinstance(t, Task) and wait_seconds > 0:
         end = time.time() + min(wait_seconds, STATUS_WAIT_MAX)
         with t.changed:
-            while t.status in RUNNING and (left := end - time.time()) > 0:
+            while t.busy() and (left := end - time.time()) > 0:
                 t.changed.wait(min(left, 1.0))
     rec = t.record() if isinstance(t, Task) else t
     return view(rec, since)
@@ -680,20 +723,19 @@ def status(home: Path, task_id: str, since: int = 0, wait_seconds: float = 0.0) 
 
 def view(rec: dict, since: int) -> dict:
     events = rec.get("events") or []
-    since = max(0, since)
-    shown = events[since:]
+    shown = [e for e in events if e.get("rev", 0) > since]   # new events and ones updated since
     cut = max(0, len(shown) - EVENTS_SHOWN)
     out = {k: rec.get(k) for k in ("task_id", "status", "error", "model", "branch", "worktree", "base",
                                    "base_sha", "seconds", "turns", "nudges")}
     out["events"] = shown[cut:]
     if cut:
         out["events_skipped"] = cut
-    out["next_since"] = len(events)
+    out["next_since"] = rec.get("rev") or max((e.get("rev", 0) for e in events), default=0)
     if rec.get("denied"):
         out["denied"] = rec["denied"]
     if rec.get("warnings"):
         out["warnings"] = rec["warnings"]
-    if rec.get("status") in RUNNING:
+    if rec.get("status") in RUNNING or not rec.get("settled", True):
         return out
     out["response"] = rec.get("response") or ""
     ch = rec.get("changes")
@@ -716,22 +758,23 @@ def reply(home: Path, task_id: str, message: str) -> dict:
     if not isinstance(t, Task):
         raise Fail(f"cannot continue this task (status {t.get('status')}); start a new one")
     t.reply(message.strip())
-    return view(t.record(), len(t.events))
+    rec = t.record()
+    return view(rec, rec["rev"])
 
 
 def cancel(home: Path, task_id: str, discard: bool = False) -> dict:
     t = _load(home, task_id)
     if isinstance(t, Task):
-        with t.lock:
-            was = t.status
-        if was in RUNNING:
+        if t.busy():
             t.stop("cancelled by the caller", status="cancelled")
-            with t.changed:   # let the runner thread see the closed process and finish
+            with t.changed:   # let the runner see the closed process, collect the changes and save
                 end = time.time() + 15
-                while t.finished is None and time.time() < end:
+                while t.busy() and time.time() < end:
                     t.changed.wait(0.5)
         else:
             t._close_client()
+        if discard and t.busy():
+            raise Fail("the task is still finishing (collecting its changes); call cancel again to discard")
         rec = t.record()
     else:
         rec = t
@@ -755,11 +798,11 @@ def cancel(home: Path, task_id: str, discard: bool = False) -> dict:
         else:
             path = tasks_dir(home) / valid_task_id(task_id) / "task.json"
             path.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
-        out = view(rec, len(rec.get("events") or []))
+        out = view(rec, rec.get("rev") or 0)
         if errors:
             out["discard_errors"] = errors
         return out
-    return view(rec, len(rec.get("events") or []))
+    return view(rec, rec.get("rev") or 0)
 
 
 def close_all() -> None:

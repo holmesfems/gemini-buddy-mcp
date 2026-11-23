@@ -51,6 +51,10 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(run("python -m unittest && del a.py"))
         self.assertFalse(run("python -m unittest > out.txt"))
         self.assertFalse(run("python -m unittest $(evil)"))
+        self.assertFalse(run("python -m unittest\ngit push"))       # a newline is a second command
+        self.assertFalse(run("python -m unittest\r\ngit push"))
+        self.assertFalse(run("python -m unittest git push"))
+        self.assertTrue(run("python -m unittest\t-v"))
         self.assertFalse(run("git status"))
         self.assertFalse(run("python -m unittest", Cwd=str(self.root.parent)))
         self.assertTrue(run("python -m unittest", BypassSandbox=False))
@@ -64,6 +68,8 @@ class PolicyTests(unittest.TestCase):
     def test_allow_commands_must_be_plain(self):
         with self.assertRaises(delegate.Fail):
             delegate.check_commands(["npm test; rm -rf /"])
+        with self.assertRaises(delegate.Fail):
+            delegate.check_commands(["npm test\ngit push"])
         self.assertEqual(delegate.check_commands([" npm   test "]), ["npm test"])
 
     def test_agy_reads_our_settings(self):
@@ -74,6 +80,12 @@ class PolicyTests(unittest.TestCase):
         s = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(s["toolPermission"], "strict")
         self.assertEqual(s["permissions"], {"allow": [], "deny": [], "ask": []})
+        path.write_text("{}", encoding="utf-8")            # an edit does not survive the next start
+        with mock.patch.dict(os.environ, {"GEMINI_BUDDY_AGY_APP_DIR": self.tmp.name}):
+            mtime = delegate.write_settings().stat().st_mtime_ns
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["toolPermission"], "strict")
+            self.assertEqual(delegate.write_settings().stat().st_mtime_ns, mtime)   # unchanged: not rewritten
+        self.assertEqual([p.name for p in path.parent.iterdir()], ["settings.json"])
 
 
 class DelegateBase(unittest.TestCase):
@@ -197,18 +209,67 @@ class DelegateRuns(DelegateBase):
         self.assertFalse(Path(t["worktree"]).exists())
         self.assertNotIn(t["branch"], self.git(self.repo, "branch"))
 
+    def test_cancel_right_after_start_settles_quickly(self):
+        import time
+        gate = __import__("threading").Event()
+        real = delegate.write_settings
+
+        def slow_settings():
+            gate.wait(5)
+            return real()
+
+        with mock.patch.object(delegate, "write_settings", slow_settings):
+            t = self.start("EDIT_INSIDE")
+            t0 = time.time()
+            threading = __import__("threading")
+            threading.Timer(0.3, gate.set).start()
+            r = asyncio.run(server.gemini_delegate_cancel(t["task_id"]))
+        self.assertLess(time.time() - t0, 10)
+        self.assertEqual(r["status"], "cancelled")
+        saved = json.loads((self.root / "home" / "delegate" / t["task_id"] / "task.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["status"], "cancelled")
+        self.assertEqual(self.sent("session/prompt"), [])
+
+    def test_patch_is_plain_whatever_the_git_config(self):
+        self.git(self.repo, "config", "color.ui", "always")
+        self.git(self.repo, "config", "diff.external", "definitely-not-a-diff-tool")
+        r = self.wait(self.start("EDIT_INSIDE")["task_id"])
+        self.assertNotIn("\x1b[", r["changes"]["patch"])
+        self.assertNotIn("error", r["changes"])
+        self.assertIn("+    return a + b", r["changes"]["patch"])
+
+    def test_since_shows_events_updated_in_place(self):
+        t = delegate.Task("0" * 32, self.root, self.repo, "HEAD", "x", "b", self.repo, "t", "m", [], None)
+        t.on_update({"sessionUpdate": "tool_call", "toolCallId": "c1", "name": "read_file", "kind": "read",
+                     "status": "in_progress"})
+        first = delegate.view(t.record(), 0)
+        t.on_permission({"toolCall": {"toolCallId": "c1", "kind": "read", "name": "read_file",
+                                      "locations": [{"path": str(self.repo / "a.py")}]},
+                         "options": [{"optionId": "a", "kind": "allow_once"}]})
+        later = delegate.view(t.record(), first["next_since"])
+        self.assertEqual([(e["i"], e["permission"]) for e in later["events"]], [(0, "allowed")])
+        rec = t.record()                                   # a copy: later updates do not change it
+        t.on_update({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"})
+        self.assertNotIn("completed", json.dumps(rec))
+
     def test_reply_continues_the_session(self):
         t = self.start("look around")
         r = self.wait(t["task_id"])
         self.assertEqual(r["changes"]["files"], [])
         with self.assertRaises(server.Fail):
             asyncio.run(server.gemini_delegate_reply(t["task_id"], ""))
+        asyncio.run(server.gemini_delegate_reply(t["task_id"], "REPLY HANG"))
+        saved = self.root / "home" / "delegate" / t["task_id"] / "task.json"
+        self.assertEqual(json.loads(saved.read_text(encoding="utf-8"))["status"], "running")   # crash => interrupted
+        asyncio.run(server.gemini_delegate_cancel(t["task_id"]))
+        t = self.start("look around")
+        r = self.wait(t["task_id"])
         asyncio.run(server.gemini_delegate_reply(t["task_id"], "REPLY EDIT_INSIDE"))
         r = self.wait(t["task_id"], since=r["next_since"])
         self.assertEqual(r["status"], "done")
         self.assertEqual(r["changes"]["files"], [{"status": "M", "path": "a.py"}])
         self.assertEqual(r["turns"], 2)
-        self.assertEqual(len(self.sent("initialize")), 1)   # same agy, same session
+        self.assertEqual(len(self.sent("initialize")), 2)   # one agy per task; the reply reused it
 
     def test_status_after_a_restart_reads_the_saved_task(self):
         t = self.start("look around")

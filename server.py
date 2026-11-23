@@ -852,7 +852,8 @@ async def gemini_delegate_status(task_id: str, wait_seconds: float = 0, since: i
     something not allowed; see warnings) / cancelled / interrupted (the server restarted).
     When not running: response (agy's summary) and changes (files, stat, patch_file, patch).
     wait_seconds: wait up to this long (max 110) for the task to finish before answering.
-    since: pass next_since from the last answer to get only new events.
+    since: pass next_since from the last answer to get only events that are new or changed since
+      (a tool call's status and permission are updated in place).
     Check the diff in the code yourself; agy's summary is a claim, not a test result.
     """
     return await anyio.to_thread.run_sync(lambda: delegate.status(home(), task_id, since, wait_seconds))
