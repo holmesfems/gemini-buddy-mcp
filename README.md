@@ -6,6 +6,7 @@
 
 Claude Code などの MCP クライアントから Gemini を「相棒」として呼ぶための、stdio 型の MCP サーバーです。[agy-media](https://github.com/holmesfems/agy-media)（スキル版）の中身をすべて MCP のツールに移しました。
 
+- **作業を任せる**：`gemini_delegate_*` で、`agy` にコードの作業を丸ごと任せられます。毎回新しい git worktree で動かし、`agy` が読み書きできるのはその中だけです。マージはせず、差分を返します。
 - **相談・メディア解析・コードレビュー**：本サーバーが、サブスクでログイン済みの [Antigravity CLI](https://antigravity.google/)（`agy`）をサブプロセスで実行します。子プロセスの環境変数から `GEMINI_API_KEY`・`GOOGLE_API_KEY` を削除するため、**API キーによる課金は発生しません**。
   - `agy acp`（[Agent Client Protocol](https://agentclientprotocol.com/) のサーバー）を 1 つ起動したままにして、呼ぶたびに新しいセッションを開きます。`agy -p` を毎回起動するより 1 回あたり 2 秒ほど速く、サインインは `agy` のログイン（`oauth-personal`）をそのまま使います。
   - `backend="agy"` の画像生成だけは、これまでどおり `agy -p` で実行します（理由は「安全のために」）。
@@ -28,6 +29,22 @@ Claude Code などの MCP クライアントから Gemini を「相棒」とし�
 | `gemini_generate_image(prompt, output_path, session_id?, backend="api")` | API / agy | 画像を生成・保存し、ファイルパスを返す。`backend="agy"` を指定するとサブスク枠を使用（1 枚あたり 50 秒ほど） |
 | `gemini_generate_audio(text, output_path, voice_name="Kore", session_id?)` | API | TTS で音声を生成・保存し、ファイルパスと長さ（秒）を返す。**`text` には読み上げる本文のみを書く**（「Say cheerfully:」のような指示文を書くと、その指示文自体も読み上げられる） |
 | `gemini_list_sessions(limit=20)` | — | 保存したセッションを新しい順に一覧表示する（`session_id`・更新日時・タイトル・関係するファイル） |
+
+### Gemini に作業を任せる（`gemini_delegate_*`）
+
+| ツール | すること |
+|---|---|
+| `gemini_delegate_start(task, repo, base?, model?, allow_commands?, session_id?)` | 新しい git worktree（`base` から切った `gemini-buddy/<id>` ブランチ）で、`agy` に作業を任せる。すぐに `task_id` を返す |
+| `gemini_delegate_status(task_id, wait_seconds=0, since=0)` | 経過（ツール呼び出しと許可・拒否、途中の文）を返す。終わっていれば `agy` のまとめ（`response`）と変更（`changes`：ファイル一覧・stat・`patch_file`・差分）も返す。`wait_seconds`（最大 110 秒）だけ終わるのを待てる |
+| `gemini_delegate_reply(task_id, message)` | 終わったタスクの同じセッションに続きを頼む（レビューで見つけた点を直させる、など） |
+| `gemini_delegate_cancel(task_id, discard=False)` | 止める（`agy` のプロセスごと終わらせる）。`discard=True` で worktree とブランチも消す（終わったタスクの片付けにも使う） |
+
+- **マージはしません**。終わったら変更を worktree でステージし、差分を `changes.patch` に書きます。MCP クライアントが差分を読んで確かめてから取り込みます（例：`git apply <patch_file>`）。`agy` の「直した」「テストが通った」は主張として扱ってください。
+- `base` の既定は `HEAD` です。手元の**コミットしていない変更は worktree に入りません**。
+- `allow_commands`：`agy` に許すコマンド（例：`["python -m unittest"]`）。先頭が一致すれば引数を付けられます。パイプ・リダイレクト・`&&`・`;`・`$`・`%` を含むものは断ります。既定は「コマンドなし」です。
+- `agy` は拒否されるとターンを終えるので、本サーバーが「それ抜きで続けて」と最大 2 回まで促します（`nudges`）。
+- `status` の値：`starting` → `checking`（切り離しの確認）→ `running` → `done` / `failed` / `stopped`（`agy` が許されないことをした。`warnings` を参照）/ `cancelled` / `interrupted`（作業中にサーバーが止まった）。
+- タスクの記録は `~/.gemini-buddy-mcp/delegate/<task_id>/`（`task.json`・`changes.patch`・`wt/`）に残ります。サーバーを再起動しても `status` は読めます。
 
 ### ローカルの下ごしらえと計測（AI モデルは使わない）
 
@@ -80,7 +97,7 @@ MCP クライアント（Claude など）および人間は、`agy`（Gemini）�
   - ACP でサインインできないと言われたら、ターミナルで一度 `agy acp --login` を実行してください（Google のサインインが開きます）。`agy acp` の標準エラーは `~/.gemini-buddy-mcp/agy-acp.log` に出ます。
 - `GEMINI_API_KEY`（API 枠で画像生成・TTS を使う場合のみ必要）
 - Pillow・numpy・OpenCV・ffmpeg（ローカルのツールに必要。`[media]` オプションでインストールされる。PATH 上に `ffmpeg` がない場合は、自動で `imageio-ffmpeg` 同梱のものを使用する）
-- git（`gemini_review` に必要）
+- git（`gemini_review` と `gemini_delegate_*` に必要）
 
 ## 入れ方
 
@@ -149,6 +166,10 @@ API 枠の画像生成・TTS 以外のツールは、`agy` のログインとロ
 | `GEMINI_BUDDY_AGY_TIMEOUT` | `600` | `agy` を待つ秒数（`gemini_review` は 1 モデルあたり 900 秒） |
 | `GEMINI_BUDDY_AGY` | PATH の `agy` | `agy` の実行ファイル |
 | `GEMINI_BUDDY_AGY_BACKEND` | `acp` | 相談・メディア解析・レビューの呼び方。`acp` = 起動したままの `agy acp`、`cli` = 毎回 `agy -p`（ACP で困ったときの戻し先。レビューは `--json-schema` で答えの形を強制する） |
+| `GEMINI_BUDDY_DELEGATE_MODEL` | `gemini-4-neon-high` | `gemini_delegate_start` の `agy` モデル |
+| `GEMINI_BUDDY_DELEGATE_TIMEOUT` | `1800` | 任せた作業 1 回（start または reply）を待つ秒数。過ぎたら止める |
+| `GEMINI_BUDDY_DELEGATE_IDLE` | `1800` | 終わったタスクの `agy` を `gemini_delegate_reply` のために残しておく秒数 |
+| `GEMINI_BUDDY_AGY_APP_DIR` | `~/.gemini/antigravity-cli` | `agy` の設定フォルダ（任せる作業用の `gemini-buddy-delegate/settings.json` をこの下に書く） |
 | `GEMINI_BUDDY_HOME` | `~/.gemini-buddy-mcp` | セッションと作業フォルダを置く場所 |
 | `AGY_BRAIN_DIR` | `~/.gemini/antigravity-cli/brain` | `agy` が画像を保存するフォルダ（`backend="agy"` で取り出す） |
 
@@ -181,6 +202,12 @@ API の画像生成または TTS がモデル ID の不一致で失敗した場�
   - **例外（`backend="agy"` の画像生成）**：`agy -p` を `accept-edits` で、毎回使い捨ての空フォルダで起動します（そこに書かれたものが、ほかのセッションに見えないように）。ACP では画像生成がサブエージェントに回され、ターンが終わってから結果が返るので（完了の通知は来ない）、今は使いません。
   - **`agy -p` の厳しい設定**：`agy -p` は毎回 `--settings` で `{"permissions": {"allow": [], "deny": ["command(*)", "write_file(*)"]}}` を渡し、ユーザーの `settings.json` の `allow` を打ち消します（`deny` が優先される）。画像生成は `write_file` を使わずに画像を保存するので、これで動きます。ACP（`agy acp`）には `--settings` が無いので、plan モードと許可の拒否で守ります。
   - **コードレビュー**：ACP には `--json-schema` に当たる仕組みが無いので、プロンプトで JSON の形を頼み、答えの中から探して読みます（そのまま・```json の囲み・前置きのあと）。読めなかったときは答えの文を `unparsed` で返すので、MCP クライアントが読んでください。
+- **任せる作業（`gemini_delegate_*`）の守り**：plan モード以外を使うので、次の何重かで `agy` を worktree の中に留めます（agy 1.5.14 の実測、2026-11）。
+  - **普段の設定から切り離す**：タスクごとに `agy acp --cli_dir_name gemini-buddy-delegate` を起動します。`agy` はユーザーの `settings.json` の代わりに `~/.gemini/antigravity-cli/gemini-buddy-delegate/settings.json` を読みます。本サーバーが起動のたびにこのファイルを `"toolPermission": "strict"`・`allow` / `deny` / `ask` を空で書き直します（このフォルダは本サーバーのものです。手で直しても上書きされます）。strict では、ファイルの読み・書き・コマンドのすべてで許可を求めてきて、こちらの答えに従いました。サインインは普段の `agy` のログインのままです。
+  - **許可の決まり**：worktree の中のファイルの読み書きだけを許します（`.git` と、`.env`・鍵・`credentials` に当たる名前は除く）。コマンドは `allow_commands` に一致するものだけで、`agy` の端末のサンドボックスの中に限ります（サンドボックスで失敗すると `agy` は `BypassSandbox: true` で聞き直してくるので、それは断る）。ほかは全部断ります。
+  - **切り離しの確認（毎回）**：`agy` の更新で `--cli_dir_name` が黙って無視されるようになると、ユーザーの設定（`read_file(*)` の許可や `proceed-in-sandbox`）が戻り、守りが静かに外れます。そこで作業の前に、確認用のファイルを読むよう頼み、`agy` が先に許可を求めてくるかを見ます。聞かずに読んだら、作業を始めずに `failed` を返します（`--cli_dir_name` なしで起動して、実際に止まることを確かめた）。この確認はユーザーの設定が読み取りを許している前提で働きます。
+  - **2 枚目の守り**：ツール呼び出しを見張り、サブエージェント（`invoke_subagent`。許可を求めずに動き、ターンが終わっても動き続ける）や、許可していない読み書き・コマンドが完了したら、`agy` のプロセスを終わらせて `stopped` にします。
+  - **守れないもの**：`search_web` は strict でも許可を求めずに動きます（送るのは検索語で、ファイルではありません）。許したコマンドは、`agy` が書いたコードを（サンドボックスの中で）実行できます。
 - **ヘッドレス `agy` のコマンド実行**：
   - 本サーバーから呼ぶ `agy` はシェルコマンドを実行しません（上の厳しい設定と plan モード）。MCP クライアント（またはユーザー）は、動画の切り出し等の前処理を事前に `media_*` ツールで済ませてから `agy` に渡してください。
   - **注意**：ヘッドレスの `agy -p` でも、`settings.json` の `allow` にあるコマンドは聞かれずに実行されます（2026-11、agy 1.5.14 の実測で `git status` が動いた）。以前この README に書いていた「ヘッドレスはコマンドを実行できない」は誤りでした。
