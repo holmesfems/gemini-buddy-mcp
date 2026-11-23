@@ -25,6 +25,11 @@ Keeping agy inside the worktree (agy 1.5.14, checked 2026-11):
   most MAX_NUDGES times.
 - Commands: an allowed command must stay in agy's terminal sandbox. When it fails there, agy
   asks again with BypassSandbox: true, which is refused.
+- Paths given to agy: with a Windows 8.3 short name in the session's cwd (C:\\Users\\ABCDEF~1\\...),
+  agy 1.5.15 reads files there without asking, even in strict mode (checked 2026-11-24; the same
+  folder under its long name asks). Every cwd sent to agy is resolve()d to its long name first:
+  the worktree, and the check folder (a short GEMINI_BUDDY_HOME or TEMP would otherwise fail the
+  check every time).
 - Not covered: search_web runs without asking (it sends a query, not files). An allowed command
   can run code that agy wrote (inside the sandbox).
 """
@@ -265,7 +270,8 @@ def isolation_check(client: AcpClient, folder: Path, model: str) -> None:
     """agy must ask before reading a file. Under the user's own settings (say read_file(*) allowed,
     or proceed-in-sandbox) it would not, which means --cli_dir_name was ignored."""
     folder.mkdir(parents=True, exist_ok=True)
-    target = (folder / "check.txt").resolve()
+    folder = folder.resolve()   # long names: see "Paths given to agy" in the module docstring
+    target = folder / "check.txt"
     target.write_text(f"{CHECK_WORD}\n", encoding="utf-8")
     turn = _CheckTurn(target)
     try:
