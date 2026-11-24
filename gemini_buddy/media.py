@@ -42,6 +42,17 @@ def ff_run(cmd: list[str]) -> str:
     return err
 
 
+def duration(path: Path) -> float | None:
+    """Length in seconds as ffmpeg reads it; None without ffmpeg or when it can't tell."""
+    try:
+        ff = find_ffmpeg()
+    except Fail:
+        return None
+    r = subprocess.run([ff, "-hide_banner", "-i", str(path)], capture_output=True, stdin=subprocess.DEVNULL)
+    m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", r.stderr.decode("utf-8", "replace"))
+    return round(int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]), 2) if m else None
+
+
 def time_range(start: float, end: float | None) -> list[str]:
     if end is not None and end <= start:
         raise Fail(f"end ({end}) must be after start ({start})")

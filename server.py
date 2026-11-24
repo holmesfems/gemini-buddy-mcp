@@ -7,8 +7,10 @@ Two backends, chosen per tool:
   child's environment so these calls never fall through to API billing.
 - Delegated coding tasks (gemini_delegate_*) -> one `agy acp` per task in its own git
   worktree, with agy's own settings swapped for strict ones (see gemini_buddy/delegate.py).
-- Image / audio generation -> the `google-genai` SDK with `GEMINI_API_KEY`
+- Image / speech / music / video generation -> the `google-genai` SDK with `GEMINI_API_KEY`
   (the monthly API credit). Images can also be made through agy (backend="agy").
+  Music and video use the Interactions API (gemini_buddy/interact.py); video runs in the
+  background and is fetched with gemini_video_status.
 
 Local tools (ffmpeg, Pillow, numpy, OpenCV) prepare inputs for agy and measure what a
 model cannot judge reliably: clips, frames with a coordinate grid, audio stats,
@@ -21,6 +23,7 @@ Tools return text and file paths, never binary data.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -37,7 +40,7 @@ from typing import Any, Literal
 import anyio
 from pydantic import BaseModel, Field
 
-from gemini_buddy import acp, delegate, measure, media
+from gemini_buddy import acp, delegate, interact, measure, media
 from gemini_buddy import review as review_mod
 from gemini_buddy.agyproc import (API_KEY_VARS, agy_env, agy_exe, decode, parse_json_tail,  # noqa: F401
                                   strict_settings_arg)
@@ -57,6 +60,8 @@ CONSULT_MODEL = os.environ.get("GEMINI_BUDDY_CONSULT_MODEL", "gemini-4-neon-high
 MEDIA_MODEL = os.environ.get("GEMINI_BUDDY_MEDIA_MODEL", "gemini-4-hydrogen-high")
 IMAGE_MODEL = os.environ.get("GEMINI_BUDDY_IMAGE_MODEL", "gemini-nano-banana-2.1")
 TTS_MODEL = os.environ.get("GEMINI_BUDDY_TTS_MODEL", "gemini-3.8-flash-tts")
+MUSIC_MODEL = os.environ.get("GEMINI_BUDDY_MUSIC_MODEL", "lyria-3.5")
+VIDEO_MODEL = os.environ.get("GEMINI_BUDDY_VIDEO_MODEL", "gemini-omni-1.2-flash")
 AGY_IMAGE_MODEL = os.environ.get("GEMINI_BUDDY_AGY_IMAGE_MODEL", "gemini-4-hydrogen-high")
 AGY_TIMEOUT = int(os.environ.get("GEMINI_BUDDY_AGY_TIMEOUT", "600"))
 
@@ -83,6 +88,9 @@ Gemini を相棒にするツール群。Claude にできない・苦手なこと
 画素の座標を読む、別のモデルの目でのレビュー）を補う。
 
 - gemini_* の相談・解析・レビューは agy（サブスク）、生成は API クレジット。どれも session_id で続きを頼める。
+- 生成: 画像 gemini_generate_image（input_paths に元画像を渡すと編集・参照）、読み上げ gemini_generate_audio、
+  音楽 gemini_generate_music、動画 gemini_generate_video（裏で走る。status が running なら gemini_video_status で待つ。
+  720p で 1 秒およそ $0.07 なので、試しは 360p で）。できた音や動画は自分では確かめられないので、解析ツールかユーザーに頼む。
 - agy は端末を使えない。長い動画は media_clip / media_frames / media_audio で先に切って渡す（30〜60 秒、720p）。
 - agy の答えはそのまま信じない:
   - 画像やコマは自分で Read して確かめる。座標は media_overlay で描いて見る。
@@ -147,7 +155,7 @@ class MediaNote(BaseModel):
 
 
 class Artifact(BaseModel):
-    kind: str  # image, audio, clip, frames, audio_stats, mix_balance, track, overlay, review
+    kind: str  # image, audio, music, video, clip, frames, audio_stats, mix_balance, track, overlay, review
     path: str
     prompt: str
     model: str = ""
@@ -287,7 +295,7 @@ def require_session(session_id: str | None) -> None:
 
 def session_context(s: Session) -> str:
     """Recent turns plus the standing notes (media summaries, generated files)."""
-    made = [a for a in s.artifacts if a.kind in ("image", "audio")]
+    made = [a for a in s.artifacts if a.kind in ("image", "audio", "music", "video")]
     turns = [t for t in s.turns if t.tool in CONTEXT_TOOLS][-RECENT_TURNS:]
     if not (turns or s.media or made):
         return ""
@@ -486,6 +494,12 @@ def model_hint(client, word: str) -> str:
         return ""
 
 
+def hint_if_missing(e: Exception, client, word: str) -> str:
+    """model_hint, but only when the error says the model was not found (not for a refused prompt)."""
+    text = str(e).lower()
+    return model_hint(client, word) if ("not found" in text or "not_found" in text or "404" in text) else ""
+
+
 def output_file(path: str) -> Path:
     p = Path(path).expanduser().resolve()
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -552,11 +566,18 @@ def write_audio(pcm: bytes, rate: int, out: Path) -> Path:
     if out.suffix.lower() == ".wav":
         write_wav(pcm, rate, out)
         return out
-    fd, tmp_name = tempfile.mkstemp(dir=out.parent, prefix=f".{out.stem}-", suffix=".wav")
+    return convert_or_keep(lambda tmp: write_wav(pcm, rate, tmp), ".wav", out)
+
+
+def convert_or_keep(write, got_ext: str, out: Path) -> Path:
+    """`write(tmp)` saves the media as a temporary `got_ext` file next to `out`; ffmpeg converts it
+    to `out`. Without ffmpeg (or if it fails) it is kept under a free `<name><got_ext>` name, so an
+    existing file of that name is never touched."""
+    fd, tmp_name = tempfile.mkstemp(dir=out.parent, prefix=f".{out.stem}-", suffix=got_ext)
     os.close(fd)
     tmp = Path(tmp_name)
     try:
-        write_wav(pcm, rate, tmp)
+        write(tmp)
         try:
             ffmpeg = media.find_ffmpeg()
             r = subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(tmp), str(out)],
@@ -565,11 +586,21 @@ def write_audio(pcm: bytes, rate: int, out: Path) -> Path:
                 return out
         except Fail:
             pass
-        wav = free_path(out.with_suffix(".wav"))
-        os.replace(tmp, wav)
-        return wav
+        kept = free_path(out.with_suffix(got_ext))
+        os.replace(tmp, kept)
+        return kept
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def write_media(data: bytes, got_ext: str, out: Path) -> Path:
+    """Save generated audio / video bytes as `out`, converting with ffmpeg when the extension differs."""
+    want = out.suffix.lower()
+    if not want or want == got_ext:
+        out = out if want else out.with_suffix(got_ext)
+        out.write_bytes(data)
+        return out
+    return convert_or_keep(lambda tmp: tmp.write_bytes(data), got_ext, out)
 
 
 # ---------------------------------------------------------------- tools: Gemini
@@ -641,13 +672,39 @@ async def gemini_analyze_media(file_path: str, prompt: str, session_id: str | No
             **with_denied(res)}
 
 
-def _generate_image_api(prompt: str, out: Path, context: str) -> tuple[Path, str, dict | None, str]:
+INLINE_IMAGES_BYTES = 18 * 1024 * 1024   # generate_content's inline request cap is 20 MB
+
+
+def image_parts(paths: list[Path]) -> list:
+    """Input images as inline parts (they come before the prompt)."""
+    from google.genai import types
+    parts, total = [], 0
+    for p in paths:
+        kind, mime = interact.kind_of(p)
+        if kind != "image":
+            raise Fail(f"input_paths takes images only, not {p.name}")
+        data = p.read_bytes()
+        total += len(data)
+        parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+    if total > INLINE_IMAGES_BYTES:
+        raise Fail(f"input images are {total // 1048576} MB together; keep them under 18 MB "
+                   "(shrink or convert them to JPEG first)")
+    return parts
+
+
+def _generate_image_api(prompt: str, out: Path, context: str, inputs: list[Path] | None = None,
+                        aspect_ratio: str | None = None,
+                        image_size: str | None = None) -> tuple[Path, str, dict | None, str]:
     from google.genai import types
     client = genai_client()
+    parts = image_parts(inputs or [])
+    look = ({k: v for k, v in (("aspect_ratio", aspect_ratio), ("image_size", image_size)) if v})
     try:
         resp = client.models.generate_content(
-            model=IMAGE_MODEL, contents=context + prompt,
-            config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]))
+            model=IMAGE_MODEL, contents=parts + [context + prompt] if parts else context + prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"],
+                image_config=types.ImageConfig(**look) if look else None))
     except Exception as e:
         raise Fail(f"image generation failed with {IMAGE_MODEL}: {e}.{model_hint(client, 'image')}")
     image, texts = None, []
@@ -679,24 +736,39 @@ def _generate_image_agy(prompt: str, out: Path, context: str) -> tuple[Path, str
 
 @mcp.tool()
 async def gemini_generate_image(prompt: str, output_path: str, session_id: str | None = None,
-                                backend: Literal["api", "agy"] = "api") -> dict:
-    """Generate an image and save it to output_path. Returns the saved path, not the image.
+                                backend: Literal["api", "agy"] = "api",
+                                input_paths: list[str] | None = None,
+                                aspect_ratio: str | None = None,
+                                image_size: Literal["512", "1K", "2K", "4K"] | None = None) -> dict:
+    """Generate or edit an image and save it to output_path. Returns the saved path, not the image.
 
     backend: "api" = google-genai SDK with GEMINI_API_KEY (API credit, fast);
              "agy" = agy's built-in generator (subscription, ~50 s per image).
-    With a session_id, earlier images and analyses in that session are given as context,
-    so "same character, brighter" style follow-ups work. Read the saved image to check it.
+    input_paths (api only): images the model sees before the prompt. One image + "make the sky
+    red" edits it; several are references ("this character in this room"; up to 14). To edit an
+    image made earlier, pass its path (the session's `history`).
+    aspect_ratio: "1:1", "3:2", "2:3", "4:3", "3:4", "4:5", "5:4", "16:9", "9:16", "21:9" ...;
+    image_size: "1K" (default), "2K", "4K" ("512" only on some models). Both api only.
+    With a session_id, earlier images and analyses in that session are given as context (as
+    text: the model does not see earlier images unless they are in input_paths).
+    Read the saved image to check it.
     """
     s = open_session(session_id, prompt)
     out = output_file(output_path)
+    inputs = [resolve_existing(p) for p in (input_paths or [])]
+    if backend == "agy" and (inputs or aspect_ratio or image_size):
+        raise Fail("input_paths, aspect_ratio and image_size need backend='api'")
     ctx = ""
     if any(a.kind == "image" for a in s.artifacts) or s.media:
         ctx = session_context(s).replace("## New request\n", "## Image to make now\n")
-    fn = _generate_image_agy if backend == "agy" else _generate_image_api
-    saved, note, usage, used = await anyio.to_thread.run_sync(fn, prompt, out, ctx)
+    if backend == "agy":
+        saved, note, usage, used = await anyio.to_thread.run_sync(_generate_image_agy, prompt, out, ctx)
+    else:
+        saved, note, usage, used = await anyio.to_thread.run_sync(
+            lambda: _generate_image_api(prompt, out, ctx, inputs, aspect_ratio, image_size))
     art = Artifact(kind="image", path=str(saved), prompt=prompt, model=used, at=now(), usage=usage)
     turn = Turn(tool="gemini_generate_image", at=now(), prompt=prompt, response=note,
-                files=[str(saved)], model=used)
+                files=[str(f) for f in inputs] + [str(saved)], model=used)
 
     def change(x: Session) -> None:
         x.artifacts.append(art)
@@ -757,6 +829,245 @@ async def gemini_generate_audio(text: str, output_path: str, voice_name: str = "
     update_session(s, change)
     return {"session_id": s.session_id, "path": str(saved), "seconds": seconds,
             "voice_name": voice_name, "model": TTS_MODEL, "usage": usage}
+
+
+# ---------------------------------------------------------------- music / video (Interactions API)
+
+def record_made(s: Session, kind: str, tool: str, prompt: str, saved: Path, model: str,
+                note: str, usage: dict | None, inputs: list[Path] = ()) -> Session:
+    art = Artifact(kind=kind, path=str(saved), prompt=prompt, model=model, at=now(), usage=usage)
+    turn = Turn(tool=tool, at=now(), prompt=prompt, response=note,
+                files=[str(f) for f in inputs] + [str(saved)], model=model)
+
+    def change(x: Session) -> None:
+        x.artifacts.append(art)
+        x.turns.append(turn)
+
+    return update_session(s, change)
+
+
+def _generate_music(prompt: str, out: Path, model: str) -> tuple[Path, str, dict | None]:
+    client = genai_client("v1beta")
+    extra: dict[str, Any] = {}
+    if "clip" not in model:  # the 30 s clip model takes no response_format
+        extra["response_format"] = {"type": "audio"}
+        if out.suffix.lower() == ".wav":
+            extra["response_format"]["mime_type"] = "audio/wav"
+    try:
+        it = client.interactions.create(model=model, input=prompt, timeout=600, **extra)
+    except Exception as e:
+        raise Fail(f"music generation failed with {model}: {e}.{hint_if_missing(e, client, 'lyria')}")
+    if it.status in interact.FAILED or it.output_audio is None:
+        raise Fail(f"no music came back (status {it.status}): {clip(interact.errors_text(it), 800) or 'no reason given'}")
+    data, mime = interact.content_bytes(client, it.output_audio)
+    saved = write_media(data, interact.out_ext(mime, ".mp3"), out)
+    return saved, it.output_text or "", interact.usage(it)
+
+
+@mcp.tool()
+async def gemini_generate_music(prompt: str, output_path: str, model: str | None = None,
+                                session_id: str | None = None) -> dict:
+    """Make music with Lyria (Interactions API, API credit, about $0.08 a song) and save it.
+
+    Describe genre, mood, tempo (BPM), instruments and structure; set the length in the prompt
+    ("a 90-second loop", or timed sections "[0:00-0:15] intro: soft piano ..."). The length is
+    only a target (asked for 30 s, got 64 s): check `seconds` and trim if it must be exact.
+    Vocals: give lyrics with [Verse] / [Chorus] tags; for BGM say "Instrumental only, no vocals."
+    Prompts naming artists or quoting existing lyrics are refused, and so are prompts too close
+    to existing music ("recitation"): describe it as an original track with concrete details.
+    model: default lyria-3.5 (full songs, up to a few minutes); lyria-3-clip-preview is always 30 s.
+    The model sends MP3 (lyria-3.5 can send WAV, asked for when output_path ends in .wav);
+    other extensions are converted with ffmpeg. Returns the path, the length, and the model's
+    notes (lyrics / structure). Claude can't hear it: check with gemini_analyze_media or the user.
+    """
+    s = open_session(session_id, prompt)
+    out = output_file(output_path)
+    use = model or MUSIC_MODEL
+    saved, notes, usage = await anyio.to_thread.run_sync(_generate_music, prompt, out, use)
+    seconds = await anyio.to_thread.run_sync(media.duration, saved)
+    record_made(s, "music", "gemini_generate_music", prompt, saved, use,
+                f"{seconds} s. {notes}".strip(), usage)
+    return {"session_id": s.session_id, "path": str(saved), "seconds": seconds, "model": use,
+            "notes": clip(notes, 4000), "usage": usage}
+
+
+def videos_dir() -> Path:
+    return home() / "videos"
+
+
+def video_job_path(interaction_id: str) -> Path:
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in interaction_id)
+    return videos_dir() / f"{safe}.json"
+
+
+def save_video_job(job: dict) -> None:
+    p = video_job_path(job["id"])
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(job, ensure_ascii=False, indent=2))
+    os.replace(tmp, p)
+
+
+def load_video_job(interaction_id: str) -> dict:
+    p = video_job_path(interaction_id)
+    if not p.exists():
+        raise Fail(f"no video job {interaction_id} (started by gemini_generate_video on this machine?)")
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+VIDEO_WAIT_MAX = 110.0   # one tool call waits at most this long; then call gemini_video_status again
+
+
+def _start_video(prompt: str, inputs: list[Path], previous: str | None, aspect_ratio: str,
+                 resolution: str, duration_seconds: int | None, task: str | None, model: str) -> str:
+    client = genai_client("v1beta")
+    fmt: dict[str, Any] = {"type": "video", "aspect_ratio": aspect_ratio, "resolution": resolution}
+    if duration_seconds is not None:
+        fmt["duration"] = f"{duration_seconds}s"
+    extra: dict[str, Any] = {}
+    if previous:
+        extra["previous_interaction_id"] = previous
+    if task:
+        extra["generation_config"] = {"video_config": {"task": task}}
+    body = interact.input_blocks(client, inputs, prompt)
+    try:
+        it = client.interactions.create(model=model, input=body, response_format=fmt,
+                                        background=True, timeout=120, **extra)
+    except Exception as e:
+        raise Fail(f"video generation failed to start with {model}: {e}.{hint_if_missing(e, client, 'omni')}")
+    if not it.id:
+        raise Fail(f"the API returned no interaction id (status {it.status})")
+    return it.id
+
+
+def _poll_video(job: dict, wait_seconds: float) -> dict:
+    """Check the job (waiting up to wait_seconds); save the video when it is done. Updates `job`."""
+    client = genai_client("v1beta")
+    deadline = time.time() + max(0.0, min(wait_seconds, VIDEO_WAIT_MAX))
+    delay = 5.0
+    while True:
+        try:
+            it = client.interactions.get(job["id"], timeout=60)
+        except Exception as e:
+            raise Fail(f"could not read video job {job['id']}: {e}")
+        status = str(it.status)
+        if status == interact.DONE:
+            if it.output_video is None:
+                job.update(status="failed", error=f"finished without a video: {clip(interact.errors_text(it), 800)}")
+                return job
+            data, mime = interact.content_bytes(client, it.output_video)
+            saved = write_media(data, interact.out_ext(mime, ".mp4"), Path(job["output_path"]))
+            job.update(status="done", path=str(saved), usage=interact.usage(it),
+                       notes=it.output_text or "", finished=now())
+            return job
+        if status in interact.FAILED or status == "requires_action":
+            job.update(status=status, error=clip(interact.errors_text(it), 2000) or "no reason given")
+            return job
+        job["status"] = "running"
+        left = deadline - time.time()
+        if left <= 0:
+            return job
+        time.sleep(min(delay, left))
+        delay = min(delay * 1.5, 20.0)
+
+
+def video_answer(job: dict) -> dict:
+    keys = ("id", "status", "path", "seconds", "model", "session_id", "error", "notes", "usage", "started")
+    out = {k: job[k] for k in keys if job.get(k) not in (None, "")}
+    out["interaction_id"] = out.pop("id")
+    if job["status"] == "running":
+        out["next"] = "call gemini_video_status with this interaction_id (wait_seconds up to 110)"
+    elif job["status"] == "done":
+        out["next"] = ("check it (media_frames / gemini_analyze_media); to edit or extend it, call "
+                       "gemini_generate_video with previous_interaction_id set to this interaction_id")
+    return out
+
+
+def finish_video(job: dict) -> dict:
+    """Save the job; when it just finished, measure it and note it in the session (once)."""
+    if job["status"] == "done" and not job.get("recorded"):
+        job["seconds"] = media.duration(Path(job["path"]))
+        if job.get("session_id"):
+            try:
+                s = open_session(job["session_id"], job["prompt"])
+                record_made(s, "video", "gemini_generate_video", job["prompt"], Path(job["path"]),
+                            job["model"], f"{job.get('seconds')} s. {job.get('notes', '')}".strip(),
+                            job.get("usage"), [Path(f) for f in job.get("inputs", [])])
+            except Fail as e:
+                log.warning("video %s: could not note it in the session: %s", job["id"], e)
+        job["recorded"] = True
+    save_video_job(job)
+    return video_answer(job)
+
+
+@mcp.tool()
+async def gemini_generate_video(prompt: str, output_path: str, input_paths: list[str] | None = None,
+                                previous_interaction_id: str | None = None,
+                                aspect_ratio: Literal["16:9", "9:16"] = "16:9",
+                                resolution: Literal["360p", "720p", "1080p", "4k"] = "720p",
+                                duration_seconds: int | None = None,
+                                task: Literal["text_to_video", "image_to_video", "reference_to_video",
+                                              "edit", "extend"] | None = None,
+                                model: str | None = None, wait_seconds: float = 100,
+                                session_id: str | None = None) -> dict:
+    """Make a video with Gemini Omni (Interactions API, API credit) and save it to output_path.
+
+    Costs roughly $0.07 per second at 720p ($0.02 at 360p, $0.10 at 1080p, $0.21 at 4k), so
+    try ideas at 360p. duration_seconds: 3-15 (model default 10). Generation runs in the
+    background: this call waits up to wait_seconds (max 110); if it is not done yet it returns
+    status "running" and an interaction_id for gemini_video_status.
+    input_paths: images (first frame, or references for characters / objects; up to 6) and
+    videos (up to 15 s) to edit; they go before the prompt. Images are sent inline, videos and
+    audio are uploaded with the Files API (kept 48 h).
+    previous_interaction_id: the interaction_id of a video made earlier, to edit it ("make it
+    night") or extend it ("continue: the camera pans left"; +3-10 s per turn, 30 s in total).
+    task: forces a mode; usually leave it out and say what you want in the prompt.
+    model: default gemini-omni-1.2-flash. Claude can't watch the result: check it with
+    media_frames / gemini_analyze_media.
+    """
+    s = open_session(session_id, prompt)
+    if duration_seconds is not None and not 3 <= duration_seconds <= 15:
+        raise Fail("duration_seconds must be 3-15")
+    out = output_file(output_path)
+    inputs = [resolve_existing(p) for p in (input_paths or [])]
+    for p in inputs:
+        interact.kind_of(p)  # fail on an unsupported file before anything is uploaded
+    use = model or VIDEO_MODEL
+    iid = await anyio.to_thread.run_sync(lambda: _start_video(
+        prompt, inputs, previous_interaction_id, aspect_ratio, resolution, duration_seconds, task, use))
+    job = {"id": iid, "status": "running", "prompt": prompt, "output_path": str(out), "model": use,
+           "session_id": s.session_id, "inputs": [str(p) for p in inputs],
+           "previous_interaction_id": previous_interaction_id, "started": now()}
+    if not session_path(s.session_id).exists():
+        save_session(s)  # so the finished video can be noted in it, even from a later call
+    save_video_job(job)
+    job = await anyio.to_thread.run_sync(_poll_video, job, wait_seconds)
+    return await anyio.to_thread.run_sync(finish_video, job)
+
+
+@mcp.tool()
+async def gemini_video_status(interaction_id: str, wait_seconds: float = 100,
+                              cancel: bool = False) -> dict:
+    """Check a video started by gemini_generate_video; save it to its output_path when done.
+
+    wait_seconds: wait up to this long (max 110) for it to finish. cancel=True stops a running
+    job (what was spent so far may still be billed). A finished job just returns its path again.
+    """
+    job = load_video_job(interaction_id)
+    if job["status"] == "done":
+        return video_answer(job)
+    if cancel:
+        def stop() -> dict:
+            try:
+                genai_client("v1beta").interactions.cancel(job["id"], timeout=60)
+            except Exception as e:
+                raise Fail(f"cancel failed: {e}")
+            job.update(status="cancelled", error="cancelled by request")
+            return finish_video(job)
+        return await anyio.to_thread.run_sync(stop)
+    job = await anyio.to_thread.run_sync(_poll_video, job, wait_seconds)
+    return await anyio.to_thread.run_sync(finish_video, job)
 
 
 @mcp.tool()
