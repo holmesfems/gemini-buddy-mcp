@@ -378,9 +378,11 @@ def run_agy(prompt: str, model: str, dirs: list[Path], mode: str = "plan",
             guard: str = GUARD, need_text: bool = True) -> dict:
     """Run one agy prompt. mode "plan" = read-only (consult / media analysis).
 
-    Other modes (accept-edits, for agy's image generator) always use `agy -p`: over ACP agy hands
-    images to a subagent that reports back after the turn ends, and outside plan mode ACP agy
-    runs commands its settings allow (e.g. proceed-in-sandbox) without asking us."""
+    Other modes (accept-edits, for agy's image generator) always use `agy -p`: outside plan mode
+    ACP agy runs commands its settings allow (e.g. proceed-in-sandbox) without asking us, and ACP
+    has no --settings to deny them. Over ACP agy hands images to a subagent, which starts without
+    asking. (agy 1.5.14 reported the image after the turn ended; 1.5.16 keeps the turn open until
+    the subagent is done, checked 2026-11-24.)"""
     if agy_backend() == "cli" or mode != "plan":
         return run_agy_cli(prompt, model, dirs, mode, guard, need_text)
     res = acp_client().prompt(guard + prompt, model, agy_workspace(), dirs, AGY_TIMEOUT)
