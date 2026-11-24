@@ -10,12 +10,12 @@ Claude Code などの MCP クライアントから Gemini を「相棒」とし�
 - **相談・メディア解析・コードレビュー**：本サーバーが、サブスクでログイン済みの [Antigravity CLI](https://antigravity.google/)（`agy`）をサブプロセスで実行します。子プロセスの環境変数から `GEMINI_API_KEY`・`GOOGLE_API_KEY` を削除するため、**API キーによる課金は発生しません**。
   - `agy acp`（[Agent Client Protocol](https://agentclientprotocol.com/) のサーバー）を 1 つ起動したままにして、呼ぶたびに新しいセッションを開きます。`agy -p` を毎回起動するより 1 回あたり 2 秒ほど速く、サインインは `agy` のログイン（`oauth-personal`）をそのまま使います。
   - `backend="agy"` の画像生成だけは、これまでどおり `agy -p` で実行します（理由は「安全のために」）。
-- **画像・音声の生成**：既定では `GEMINI_API_KEY` を使って `google-genai` SDK（API のクレジット枠）で実行します。画像生成のみ、`backend="agy"` を指定することで `agy` 組み込みの画像生成（サブスク枠）も使用できます。
+- **画像・読み上げ・音楽・動画の生成**：`GEMINI_API_KEY` を使って `google-genai` SDK（API のクレジット枠）で実行します。音楽（Lyria）と動画（Gemini Omni）は Interactions API を使います。画像生成のみ、`backend="agy"` を指定することで `agy` 組み込みの画像生成（サブスク枠）も使用できます。
 - **機械的な下ごしらえと計測（ローカル実行）**：AI モデルを使わずローカルで処理します（ffmpeg での切り出し・コマ画像化・座標の目盛り、無音区間・ラウドネス・スペクトログラム、声と BGM の音量差、OpenCV での追跡、座標の描き込み確認）。
 - **セッション管理**：どのツールも `session_id` を受け取れます。会話・解析したメディアの要約・生成したファイルの記録は `~/.gemini-buddy-mcp/sessions/<session_id>.json` に保存され、同じ `session_id` を渡すことで続きから依頼できます。
 - **返り値の形式**：すべてのツールはテキストとファイルパスのみを返します。画像や音声のバイナリデータは返しません。
 
-> English: A stdio MCP server that lets Claude consult Gemini through the subscription-authenticated `agy` CLI (API keys are stripped from its environment) for second opinions, media analysis and code review; generate images and speech with the `google-genai` SDK; and prepare / measure media locally (ffmpeg, numpy, OpenCV). Every tool shares a persistent `session_id`. Tools return text and file paths, never binary data.
+> English: A stdio MCP server that lets Claude consult Gemini through the subscription-authenticated `agy` CLI (API keys are stripped from its environment) for second opinions, media analysis and code review; generate and edit images, and generate speech, music and video with the `google-genai` SDK; and prepare / measure media locally (ffmpeg, numpy, OpenCV). Every tool shares a persistent `session_id`. Tools return text and file paths, never binary data.
 
 ## ツール
 
@@ -26,8 +26,11 @@ Claude Code などの MCP クライアントから Gemini を「相棒」とし�
 | `gemini_consult(prompt, file_paths?, session_id?, model?)` | agy | コードや設計のセカンドオピニオン。`file_paths` で渡したファイルは Gemini が自分で開いて読む |
 | `gemini_analyze_media(file_path, prompt, session_id?, model?, more_files?)` | agy | 動画・音声・画像を見て・聞いての文字起こし、話者分け、画面の動き、BGM が場面に合うか、おおよその座標。回答の要約をセッションに保存する |
 | `gemini_review(repo, base?, commit?, staged?, intent?, models?, allow_secret_like?, session_id?, out_dir?)` | agy | git の差分を読み取り専用でレビューする。既定は Neon 1 モデル（Claude と組むなら、別の Gemini を足しても視点はあまり広がらない）。複数のモデルを指定した場合、同じ箇所への指摘をまとめる。答えから指摘の JSON を読めなかったときは、答えの文を `unparsed` で返す |
-| `gemini_generate_image(prompt, output_path, session_id?, backend="api")` | API / agy | 画像を生成・保存し、ファイルパスを返す。`backend="agy"` を指定するとサブスク枠を使用（1 枚あたり 50 秒ほど） |
+| `gemini_generate_image(prompt, output_path, session_id?, backend="api", input_paths?, aspect_ratio?, image_size?)` | API / agy | 画像を生成・保存し、ファイルパスを返す。`input_paths` に画像を渡すと、それを編集する（1 枚）か参照にする（複数、最大 14 枚）。`aspect_ratio`（`16:9` など）・`image_size`（`1K`・`2K`・`4K`）も指定できる。この 3 つは API のみ。`backend="agy"` を指定するとサブスク枠を使用（1 枚あたり 50 秒ほど） |
 | `gemini_generate_audio(text, output_path, voice_name="Kore", session_id?)` | API | TTS で音声を生成・保存し、ファイルパスと長さ（秒）を返す。**`text` には読み上げる本文のみを書く**（「Say cheerfully:」のような指示文を書くと、その指示文自体も読み上げられる） |
+| `gemini_generate_music(prompt, output_path, model?, session_id?)` | API | Lyria で曲を作って保存し、パス・長さ（秒）・モデルのメモ（歌詞・構成）を返す。長さはプロンプトで指定する（「90 秒のループ」など）。ただし目安にしかならない（30 秒と頼んで 64 秒が届いた例あり）ので、返りの `seconds` を見る。BGM なら「Instrumental only, no vocals.」と書く。既定の `lyria-3.5` は 1 曲 $0.08 ほど。MP3 で届き、`.wav` を指定すると WAV で頼む。ほかの拡張子は ffmpeg で変換する |
+| `gemini_generate_video(prompt, output_path, input_paths?, previous_interaction_id?, aspect_ratio="16:9", resolution="720p", duration_seconds?, task?, model?, wait_seconds=100, session_id?)` | API | Gemini Omni で動画を作る。裏で走らせて `wait_seconds`（最大 110 秒）だけ待ち、間に合わなければ `status: "running"` と `interaction_id` を返す。`input_paths` は最初のコマや参照の画像、編集する動画（15 秒まで）。`previous_interaction_id` に前の動画の `interaction_id` を渡すと、それを編集・延長する。長さは 3〜15 秒（既定 10 秒）。**720p で 1 秒 $0.07 ほど**（360p は $0.02、1080p は $0.10）なので、試しは 360p で |
+| `gemini_video_status(interaction_id, wait_seconds=100, cancel=False)` | API | `gemini_generate_video` の続きを待ち、できたら `output_path` に保存してパスと長さを返す。`cancel=True` で止める。記録は `~/.gemini-buddy-mcp/videos/` に残るので、サーバーを再起動しても読める |
 | `gemini_list_sessions(limit=20)` | — | 保存したセッションを新しい順に一覧表示する（`session_id`・更新日時・タイトル・関係するファイル） |
 
 ### Gemini に作業を任せる（`gemini_delegate_*`）
@@ -95,7 +98,7 @@ MCP クライアント（Claude など）および人間は、`agy`（Gemini）�
 - Python 3.10+
 - `agy`（インストールおよびログイン済みであること。`agy models` を実行してモデル一覧が表示されること）
   - ACP でサインインできないと言われたら、ターミナルで一度 `agy acp --login` を実行してください（Google のサインインが開きます）。`agy acp` の標準エラーは `~/.gemini-buddy-mcp/agy-acp.log` に出ます。
-- `GEMINI_API_KEY`（API 枠で画像生成・TTS を使う場合のみ必要）
+- `GEMINI_API_KEY`（API 枠で画像・読み上げ・音楽・動画を生成する場合のみ必要）
 - Pillow・numpy・OpenCV・ffmpeg（ローカルのツールに必要。`[media]` オプションでインストールされる。PATH 上に `ffmpeg` がない場合は、自動で `imageio-ffmpeg` 同梱のものを使用する）
 - git（`gemini_review` と `gemini_delegate_*` に必要）
 
@@ -139,9 +142,9 @@ claude mcp add gemini-buddy --scope user -- /path/to/gemini-buddy-mcp/.venv/bin/
 claude mcp add gemini-buddy --scope user -- uvx --from "gemini-buddy-mcp[media] @ git+https://github.com/holmesfems/gemini-buddy-mcp" gemini-buddy-mcp
 ```
 
-### API キーの設定（API 枠の画像生成・TTS を使う場合のみ）
+### API キーの設定（API 枠で生成する場合のみ）
 
-API 枠の画像生成・TTS 以外のツールは、`agy` のログインとローカル環境だけで動作します。
+API 枠の生成（画像・読み上げ・音楽・動画）以外のツールは、`agy` のログインとローカル環境だけで動作します。
 
 - **推奨手順**：`GEMINI_API_KEY` を OS のユーザー環境変数に設定してください（Windows なら「環境変数を編集」からユーザー環境変数に追加）。本サーバーが自動で引き継ぎます。
   - **設定後の必須操作**：キーを設定したあとは、Claude Code（デスクトップアプリの場合はアプリ全体）を**再起動**してください。起動中のプロセスには新しい環境変数が反映されません。
@@ -163,6 +166,8 @@ API 枠の画像生成・TTS 以外のツールは、`agy` のログインとロ
 | `GEMINI_BUDDY_AGY_IMAGE_MODEL` | `gemini-4-hydrogen-high` | `backend="agy"` の画像生成で使う `agy` モデル |
 | `GEMINI_BUDDY_IMAGE_MODEL` | `gemini-nano-banana-2.1` | API の画像生成モデル |
 | `GEMINI_BUDDY_TTS_MODEL` | `gemini-3.8-flash-tts` | API の読み上げモデル |
+| `GEMINI_BUDDY_MUSIC_MODEL` | `lyria-3.5` | 音楽のモデル（`lyria-3-clip-preview` は 30 秒固定） |
+| `GEMINI_BUDDY_VIDEO_MODEL` | `gemini-omni-1.2-flash` | 動画のモデル |
 | `GEMINI_BUDDY_AGY_TIMEOUT` | `600` | `agy` を待つ秒数（`gemini_review` は 1 モデルあたり 900 秒） |
 | `GEMINI_BUDDY_AGY` | PATH の `agy` | `agy` の実行ファイル |
 | `GEMINI_BUDDY_AGY_BACKEND` | `acp` | 相談・メディア解析・レビューの呼び方。`acp` = 起動したままの `agy acp`、`cli` = 毎回 `agy -p`（ACP で困ったときの戻し先。レビューは `--json-schema` で答えの形を強制する） |
@@ -173,7 +178,7 @@ API 枠の画像生成・TTS 以外のツールは、`agy` のログインとロ
 | `GEMINI_BUDDY_HOME` | `~/.gemini-buddy-mcp` | セッションと作業フォルダを置く場所 |
 | `AGY_BRAIN_DIR` | `~/.gemini/antigravity-cli/brain` | `agy` が画像を保存するフォルダ（`backend="agy"` で取り出す） |
 
-API の画像生成または TTS がモデル ID の不一致で失敗した場合、エラーメッセージにその API キーで利用可能な近い名前のモデル一覧が出力されます。その中から適切な ID を選び、`GEMINI_BUDDY_IMAGE_MODEL` または `GEMINI_BUDDY_TTS_MODEL` に設定してください。
+API の生成がモデル ID の不一致で失敗した場合、エラーメッセージにその API キーで利用可能な近い名前のモデル一覧が出力されます。その中から適切な ID を選び、`GEMINI_BUDDY_IMAGE_MODEL`・`GEMINI_BUDDY_TTS_MODEL`・`GEMINI_BUDDY_MUSIC_MODEL`・`GEMINI_BUDDY_VIDEO_MODEL` のどれかに設定してください（モデル一覧の API には音楽・動画のモデルが出ないことがあります）。
 
 ## Gemini 4 のモデルの比べ（agy-media での実測、agy 1.5.12）
 
