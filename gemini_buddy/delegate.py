@@ -18,19 +18,24 @@ Keeping agy inside the worktree (agy 1.5.14, checked 2026-11):
 - Check at start (canary): if a later agy ignored --cli_dir_name, the user's settings would apply
   again without any error. Before each task, agy is asked to read a check file and must ask us
   first; a read done without asking stops the task before it begins.
-- Second guard: tool calls are watched. A subagent (invoke_subagent; it runs without asking,
-  and keeps going after the turn ends) or a read / edit / command that finishes without our
-  approval kills the process and stops the task.
+- Second guard: tool calls are watched. A subagent (invoke_subagent; it starts without asking)
+  or a read / edit / command that finishes without our approval kills the process and stops the
+  task. With agy 1.5.14 a subagent kept going after the turn ended. With agy 1.5.16 a subagent's
+  file read came to us as a permission request and our rejection held (checked 2026-11-24); not
+  every tool was tried, so subagents still stop the task.
 - agy ends its turn when an action is rejected. The task is then nudged to go on without it, at
   most MAX_NUDGES times.
 - Commands: an allowed command must stay in agy's terminal sandbox. When it fails there, agy
   asks again with BypassSandbox: true, which is refused.
 - Paths given to agy: with a Windows 8.3 short name in the session's cwd (C:\\Users\\ABCDEF~1\\...),
   agy 1.5.15 reads files there without asking, even in strict mode (checked 2026-11-24; the same
-  folder under its long name asks). Every cwd sent to agy is resolve()d to its long name first:
-  the worktree, and the check folder (a short GEMINI_BUDDY_HOME or TEMP would otherwise fail the
-  check every time).
-- Not covered: search_web runs without asking (it sends a query, not files). An allowed command
+  folder under its long name asks). agy 1.5.16 asked under both names (one try, 2026-11-24).
+  Every cwd sent to agy is still resolve()d to its long name first: the worktree, and the check
+  folder (a short GEMINI_BUDDY_HOME or TEMP would otherwise fail the check every time under 1.5.15).
+- agy 1.5.16 lets Auto mode create or edit files outside the workspace without asking when they
+  are inside a repository. Under our strict settings it still asked before writing into another
+  git repository, and our rejection held (checked 2026-11-24).
+- Not covered: search_web runs without asking, still in agy 1.5.16 (it sends a query, not files). An allowed command
   can run code that agy wrote (inside the sandbox).
 """
 from __future__ import annotations
