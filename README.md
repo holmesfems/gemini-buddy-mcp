@@ -25,7 +25,7 @@ Claude Code などの MCP クライアントから Gemini を「相棒」とし�
 |---|---|---|
 | `gemini_consult(prompt, file_paths?, session_id?, model?)` | agy | コードや設計のセカンドオピニオン。`file_paths` で渡したファイルは Gemini が自分で開いて読む |
 | `gemini_analyze_media(file_path, prompt, session_id?, model?, more_files?)` | agy | 動画・音声・画像を見て・聞いての文字起こし、話者分け、画面の動き、BGM が場面に合うか、おおよその座標。回答の要約をセッションに保存する |
-| `gemini_review(repo, base?, commit?, staged?, intent?, models?, allow_secret_like?, session_id?, out_dir?)` | agy | git の差分を読み取り専用でレビューする。既定は Neon 1 モデル（Claude と組むなら、別の Gemini を足しても視点はあまり広がらない）。複数のモデルを指定した場合、同じ箇所への指摘をまとめる。答えから指摘の JSON を読めなかったときは、答えの文を `unparsed` で返す |
+| `gemini_review(repo, base?, commit?, staged?, paths?, intent?, models?, allow_secret_like?, session_id?, out_dir?)` | agy | git の差分を読み取り専用でレビューする。`paths=[...]` を渡すと、差分ではなくファイル・フォルダを今の中身のまままるごとレビューする（データの計算スクリプトそのものの見直しなど。git が無視していないファイルが対象で、計算の式・単位・丸めも見るよう頼む）。既定は Neon 1 モデル（Claude と組むなら、別の Gemini を足しても視点はあまり広がらない）。複数のモデルを指定した場合、同じ箇所への指摘をまとめる。答えから指摘の JSON を読めなかったときは、答えの文を `unparsed` で返す |
 | `gemini_generate_image(prompt, output_path, session_id?, backend="api", input_paths?, aspect_ratio?, image_size?)` | API / agy | 画像を生成・保存し、ファイルパスを返す。`input_paths` に画像を渡すと、それを編集する（1 枚）か参照にする（複数、最大 14 枚）。`aspect_ratio`（`16:9` など）・`image_size`（`1K`・`2K`・`4K`）も指定できる。この 3 つは API のみ。`backend="agy"` を指定するとサブスク枠を使用（1 枚あたり 50 秒ほど） |
 | `gemini_generate_audio(text, output_path, voice_name="Kore", session_id?)` | API | TTS で音声を生成・保存し、ファイルパスと長さ（秒）を返す。**`text` には読み上げる本文のみを書く**（「Say cheerfully:」のような指示文を書くと、その指示文自体も読み上げられる） |
 | `gemini_generate_music(prompt, output_path, model?, session_id?)` | API | Lyria で曲を作って保存し、パス・長さ（秒）・モデルのメモ（歌詞・構成）を返す。長さはプロンプトで指定する（「90 秒のループ」など）。ただし目安にしかならない（30 秒と頼んで 64 秒が届いた例あり）ので、返りの `seconds` を見る。BGM なら「Instrumental only, no vocals.」と書く。既定の `lyria-3.5` は 1 曲 $0.08 ほど。MP3 で届き、`.wav` を指定すると WAV で頼む。ほかの拡張子は ffmpeg で変換する |
@@ -243,8 +243,8 @@ agy 1.5.16 で Gemini 4 Carbon（Low・Medium・High。XHigh は無い）が使�
 - **`gemini_review` のデータ送信と秘密情報の保護**：
   - **外部送信の前提**：`gemini_review` に渡されたコードは Google に送信されます。
   - **本サーバー側の自動保護**：
-    - `.env`・鍵・`credentials` に該当するファイル（大文字・小文字を区別しない）は、自動で差分から除外します。
-    - 差分のいずれかの行に API キーや秘密鍵らしい文字列を検知した場合、外部へ一切送信せず `STOPPED` を返します（`allow_secret_like` で明示的に許可しない限り）。
+    - `.env`・鍵・`credentials` に該当するファイル（大文字・小文字を区別しない）は、自動で差分から除外します（`paths` でファイルをまるごと送るときも同じ）。
+    - 差分のいずれかの行（`paths` のときはファイルのすべての行）に API キーや秘密鍵らしい文字列を検知した場合、外部へ一切送信せず `STOPPED` を返します（`allow_secret_like` で明示的に許可しない限り）。
   - **ユーザー側で必要な追加対策（重要）**：`agy` プロセス自体はリポジトリ全体を読み取れます。リポジトリ内に秘密情報を含むファイルがある場合は、**ユーザー側で `agy` の `settings.json` の `deny` に、そのファイルかフォルダの絶対パスで読み取り拒否ルールを追加してください**。例：
     ```json
     "deny": [
