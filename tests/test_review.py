@@ -161,7 +161,59 @@ class BuildDiff(unittest.TestCase):
             self.assertNotIn(name, diff)
 
 
+class BuildFiles(BuildDiff):
+    def test_whole_files_as_added_lines(self):
+        (self.repo / "calc").mkdir()
+        (self.repo / "calc" / "risei.py").write_text("x = 1\ny = x / 2\n")   # untracked, not ignored
+        (self.repo / "calc" / ".env").write_text("X=1\n")
+        (self.repo / "calc" / "img.bin").write_bytes(b"\x00\x01")
+        (self.repo / ".gitignore").write_text("*.log\n")
+        (self.repo / "calc" / "out.log").write_text("log\n")
+        diff, skipped = review.build_files(self.repo, self.repo, ["calc"])
+        self.assertIn("+++ b/calc/risei.py\n@@ -0,0 +1,2 @@\n+x = 1\n+y = x / 2\n", diff)
+        for name in (".env", "out.log", "img.bin"):
+            self.assertNotIn(name, diff)
+        self.assertEqual(skipped, ["calc/img.bin"])
+
+    def test_relative_to_repo_folder_and_absolute(self):
+        (self.repo / "sub").mkdir()
+        (self.repo / "sub" / "b.py").write_text("b\n")
+        diff, _ = review.build_files(self.repo, self.repo / "sub", ["b.py", str(self.repo / "a.txt")])
+        self.assertIn("+++ b/sub/b.py", diff)
+        self.assertIn("+++ b/a.txt", diff)
+
+    def test_outside_the_repository_is_refused(self):
+        with tempfile.TemporaryDirectory() as other:
+            with self.assertRaises(Fail):
+                review.pathspecs(self.repo, self.repo, [other])
+
+
 class Review(BuildDiff):
+    def test_paths_and_another_target_conflict(self):
+        with self.assertRaises(Fail):
+            review.review(str(self.repo), staged=True, paths=["a.txt"], out=self.repo / "_w")
+
+    def test_paths_with_nothing_to_send_is_an_error(self):
+        (self.repo / ".env").write_text("X=1\n")
+        with self.assertRaises(Fail):
+            review.review(str(self.repo), paths=[".env"], out=Path(self.tmp.name) / "w")
+
+    def test_paths_reviews_files_with_no_change(self):
+        (self.repo / "a.txt").write_text(f'{KEY} = "{VAL}"\n')
+        git(self.repo, "commit", "-qam", "secret")   # clean tree: the diff modes have nothing
+        with mock.patch.object(review, "run_model") as run:
+            r = review.review(str(self.repo), paths=["a.txt"], out=Path(self.tmp.name) / "w")
+        self.assertEqual(r["status"], "STOPPED")      # the secret check covers whole files too
+        run.assert_not_called()
+        (self.repo / "a.txt").write_text("total = a / b\n")
+        with mock.patch.object(review, "run_model_safe",
+                               return_value={"model": "m", "status": "SUCCESS", "findings": []}):
+            r = review.review(str(self.repo), paths=["a.txt"], out=Path(self.tmp.name) / "w3")
+        self.assertEqual(r["status"], "SUCCESS")
+        ask = (Path(self.tmp.name) / "w3" / "ask.txt").read_text(encoding="utf-8")
+        self.assertIn("review existing code", ask)
+        self.assertIn("+total = a / b", (Path(self.tmp.name) / "w3" / "diff.patch").read_text(encoding="utf-8"))
+
     def test_empty_diff_is_an_error(self):
         with self.assertRaises(Fail):
             review.review(str(self.repo), out=self.repo / "_w")

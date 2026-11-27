@@ -1,5 +1,8 @@
 """Independent code review of a git diff by agy (Gemini), ported from agy-media's agy-review.
 
+With `paths`, whole files are reviewed instead of a change: their working-tree contents are sent
+as a diff that adds every line, so the same secret check and findings format apply.
+
 Gemini is trained apart from Claude, so its blind spots differ. agy reads the diff (and the
 repository around it, read-only) and answers with findings as JSON. One model (Neon) is the
 default: a second Gemini adds little to a Claude + Gemini pair. With several models, findings that
@@ -19,6 +22,7 @@ Over `agy -p` (GEMINI_BUDDY_AGY_BACKEND=cli) --json-schema enforces it.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -93,6 +97,18 @@ How to work:
 4. Do NOT report style, naming, formatting, missing comments or tests, or matters of taste. Do not report pre-existing problems in code the diff does not touch, unless the change makes them worse.
 5. Fewer, real findings are better than many weak ones. An empty list is a valid answer.
 Answer with JSON matching the schema: findings[] with file (repo-relative), line (in the new version of the file), severity (high/medium/low), category, summary and failure_scenario (write these two in Japanese), confidence (0..1); and optional notes (Japanese).
+"""
+
+TASK_FILES = """Task: review existing code in the repository at {repo}.
+The files to review are in {diff}, written as a diff that adds every line (paths relative to the repository root; line numbers are those of the file). This is the code as it is now, not a change.
+{intent}
+How to work:
+1. Read the files in {diff}. Then open the code they call or that calls them inside the repository to understand the context.
+2. Look for real defects in these files: wrong logic, off-by-one, wrong conditions, missing cases, broken error handling, race conditions, resource leaks, security problems, API misuse, mismatches with the code that calls it, and behaviour that contradicts the stated intent. For code that computes numbers, also check the calculation itself: wrong formulas, mixed-up units or scales, wrong weights or denominators, integer division, rounding or float precision that changes the result, rows or columns read from the wrong place or silently dropped, and missing or zero values handled in a way that skews the result.
+3. Before reporting a finding, re-read the code and convince yourself it really fails. Give a concrete failure scenario (input or state -> wrong result). If you cannot, drop it or give it low confidence.
+4. Do NOT report style, naming, formatting, missing comments or tests, or matters of taste. Report only problems located in the listed files (the other code is context).
+5. Fewer, real findings are better than many weak ones. An empty list is a valid answer.
+Answer with JSON matching the schema: findings[] with file (repo-relative), line (line number in the file), severity (high/medium/low), category, summary and failure_scenario (write these two in Japanese), confidence (0..1); and optional notes (Japanese).
 """
 
 
@@ -175,6 +191,57 @@ def build_diff(repo: Path, a) -> tuple[str, str]:
     else:
         diff = git(repo, "diff", "HEAD", *common, "--", ".", *SECRET_PATHS)
     return diff, intent
+
+
+def pathspecs(root: Path, base_dir: Path, paths: list[str]) -> list[str]:
+    """Repo-relative pathspecs for `paths` (absolute, or relative to base_dir; globs allowed)."""
+    out = []
+    for raw in paths:
+        if not isinstance(raw, str) or not raw.strip():
+            raise Fail("paths: give files or folders as non-empty strings")
+        p = Path(raw.strip()).expanduser()
+        p = Path(os.path.abspath(p if p.is_absolute() else base_dir / p))
+        try:
+            rel = p.relative_to(root)
+        except ValueError:
+            # resolve() follows a symlinked or subst'ed drive to the same place as root
+            try:
+                rel = p.resolve().relative_to(root)
+            except ValueError:
+                raise Fail(f"paths: {raw} is outside the repository {root}") from None
+        out.append(rel.as_posix() if rel.parts else ".")
+    return out
+
+
+def build_files(root: Path, base_dir: Path, paths: list[str]) -> tuple[str, list[str]]:
+    """Whole files under `paths` (tracked, or untracked and not ignored; working-tree contents) as
+    a diff that adds every line. Secret-holding files, binaries and submodules are left out.
+
+    Returns (diff text, files skipped as binary or unreadable).
+    """
+    specs = pathspecs(root, base_dir, paths)
+    listed = git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--",
+                 *specs, *SECRET_PATHS)
+    names = list(dict.fromkeys(n for n in listed.split("\0") if n))
+    parts, skipped = [], []
+    for name in names:
+        f = root / name
+        if f.is_symlink() or not f.is_file():  # deleted in the working tree, or a submodule
+            continue
+        try:
+            data = f.read_bytes()
+        except OSError:
+            skipped.append(name)
+            continue
+        if b"\0" in data[:8192]:
+            skipped.append(name)
+            continue
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        head = f"diff --git a/{name} b/{name}\nnew file mode 100644\n--- /dev/null\n+++ b/{name}\n"
+        if lines:
+            head += f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(f"+{x}\n" for x in lines)
+        parts.append(head)
+    return "".join(parts), skipped
 
 
 def secret_like_lines(diff: str):
@@ -292,23 +359,38 @@ def merge(results, near: int):
 def review(repo: str = ".", base: str | None = None, commit: str | None = None, staged: bool = False,
            intent: str | None = None, models: list[str] | None = None, out: Path | None = None,
            near: int = 3, max_diff_kb: int = 400, allow_secret_like: bool = False,
-           timeout: int = 900, client=None) -> dict:
+           timeout: int = 900, client=None, paths: list[str] | None = None) -> dict:
     """Build the diff, run each model (in parallel), merge the findings, write review.json into `out`.
 
+    paths: review these files / folders as they are (relative paths are relative to `repo`)
+      instead of a change.
     client: an acp.AcpClient to ask over ACP; None runs `agy -p` with --json-schema.
     """
-    if sum(bool(x) for x in (base, commit, staged)) > 1:
-        raise Fail("give only one of base, commit, staged")
-    root = Path(git(Path(repo).expanduser(), "rev-parse", "--show-toplevel").strip()).resolve()
+    if paths is not None and not isinstance(paths, list):
+        raise Fail("paths: give a list of files or folders")
+    if sum(bool(x) for x in (base, commit, staged, paths)) > 1:
+        raise Fail("give only one of base, commit, staged, paths")
+    base_dir = Path(os.path.abspath(Path(repo).expanduser()))
+    root = Path(git(base_dir, "rev-parse", "--show-toplevel").strip()).resolve()
     work = Path(out).resolve()
     work.mkdir(parents=True, exist_ok=True)
 
-    diff, default_intent = build_diff(root, SimpleNamespace(base=base, commit=commit, staged=staged))
-    if not diff.strip():
-        raise Fail("empty diff: nothing to review (check base / commit / staged)")
-    if len(diff.encode("utf-8")) > max_diff_kb * 1024:
-        raise Fail(f"diff is larger than {max_diff_kb} KB: review it in parts (commit, or a narrower base), "
+    skipped: list[str] = []
+    if paths:
+        diff, skipped = build_files(root, base_dir, paths)
+        default_intent = ""
+        if not diff.strip():
+            raise Fail("paths: no text files to review (missing, ignored by git, binary, "
+                       "or left out as secret files)")
+        too_big = f"files are larger than {max_diff_kb} KB: review fewer files or folders, or raise max_diff_kb"
+    else:
+        diff, default_intent = build_diff(root, SimpleNamespace(base=base, commit=commit, staged=staged))
+        if not diff.strip():
+            raise Fail("empty diff: nothing to review (check base / commit / staged)")
+        too_big = (f"diff is larger than {max_diff_kb} KB: review it in parts (commit, or a narrower base), "
                    "or raise max_diff_kb")
+    if len(diff.encode("utf-8")) > max_diff_kb * 1024:
+        raise Fail(too_big)
     hits = secret_like_lines(diff)
     if hits and not allow_secret_like:
         return {"status": "STOPPED", "reason": "lines of the diff look like secrets; nothing was sent. "
@@ -319,8 +401,9 @@ def review(repo: str = ".", base: str | None = None, commit: str | None = None, 
     diff_path.write_text(diff, encoding="utf-8")
     schema_path = work / "schema.json"
     schema_path.write_text(json.dumps(SCHEMA, ensure_ascii=False), encoding="utf-8")
-    intent_text = f"Stated intent of the change (from the author):\n{intent}\n" if intent else ""
-    prompt = GUARD + TASK.format(repo=root, diff=diff_path, intent=intent_text)
+    what = "the code" if paths else "the change"
+    intent_text = f"Stated intent of {what} (from the author):\n{intent}\n" if intent else ""
+    prompt = GUARD + (TASK_FILES if paths else TASK).format(repo=root, diff=diff_path, intent=intent_text)
     (work / "ask.txt").write_text(prompt, encoding="utf-8")
 
     use = list(dict.fromkeys(models or DEFAULT_MODELS))  # same model twice would overwrite its result file
@@ -337,6 +420,7 @@ def review(repo: str = ".", base: str | None = None, commit: str | None = None, 
         "repo": str(root),
         "diff": str(diff_path),
         "diff_files": len(re.findall(r"^\+\+\+ ", diff, flags=re.M)),
+        **({"skipped_files": skipped} if skipped else {}),
         "models": [{k: r.get(k) for k in ("model", "status", "seconds", "denied_actions", "structured", "error")
                     if k in r} | {"findings": len(r.get("findings", []))} for r in results],
         "findings": groups,

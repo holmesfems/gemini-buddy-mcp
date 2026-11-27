@@ -1076,12 +1076,17 @@ async def gemini_video_status(interaction_id: str, wait_seconds: float = 100,
 async def gemini_review(repo: str, base: str | None = None, commit: str | None = None,
                         staged: bool = False, intent: str | None = None,
                         models: list[str] | None = None, allow_secret_like: bool = False,
-                        session_id: str | None = None, out_dir: str | None = None) -> dict:
-    """Independent code review of a git diff by Gemini (agy, subscription, read-only plan mode).
+                        session_id: str | None = None, out_dir: str | None = None,
+                        paths: list[str] | None = None) -> dict:
+    """Independent code review of a git diff, or of whole files, by Gemini (agy, subscription,
+    read-only plan mode).
 
     What to review (pick one; default = uncommitted changes vs HEAD): base="origin/main" for this
-    branch, commit="<sha>" for one commit, staged=True for staged changes.
-    intent: what the change is meant to do, in the author's words (default: commit messages).
+    branch, commit="<sha>" for one commit, staged=True for staged changes, or paths=[...] for
+    existing code as it is now (files or folders, absolute or relative to `repo`; globs allowed;
+    tracked files and untracked ones git does not ignore; binaries go to `skipped_files`).
+    intent: what the change (or, with paths, the code) is meant to do, in the author's words
+      (default: commit messages; none with paths).
       Do not put your own review opinions here; the point is an independent second look.
     models: agy models (default gemini-4-neon-high alone; another Gemini adds little next to
       Claude). With several, findings on the same place are merged; `agreed` = how many models.
@@ -1092,13 +1097,14 @@ async def gemini_review(repo: str, base: str | None = None, commit: str | None =
     Takes minutes. Findings are candidates: trace each one in the code before reporting it.
     """
     target = f"commit {commit}" if commit else f"branch vs {base}" if base else \
-        "staged changes" if staged else "uncommitted changes"
+        "staged changes" if staged else f"files {', '.join(map(str, paths))}" if paths else \
+        "uncommitted changes"
     s = open_session(session_id, f"review {target} in {repo}")  # before minutes of work
     work = work_dir("review", out_dir, session_id)
     client = acp_client if agy_backend() == "acp" else None
     result = await anyio.to_thread.run_sync(lambda: review_mod.review(
         repo, base=base, commit=commit, staged=staged, intent=intent, models=models, out=work,
-        allow_secret_like=allow_secret_like, client=client() if client else None))
+        allow_secret_like=allow_secret_like, client=client() if client else None, paths=paths))
     if result.get("status") == "STOPPED":
         return result
     lines = [f"- [{g['severity']}] {g['file']}:{g['line']} (agreed {g['agreed']}): "
